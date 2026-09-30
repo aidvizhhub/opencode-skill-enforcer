@@ -1,4 +1,6 @@
-import { appendFileSync } from "node:fs"
+import { appendFileSync, readFileSync, statSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 
 /**
@@ -24,6 +26,13 @@ import { Plugin } from "@opencode/plugin"
  *   defaultSkills   — список ID для добивки, когда padToMin включён
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
  *   minScore        — порог совпадения для авто-подбора; триггер весит 2, описание 1 (по умолчанию 3)
+ *   documents       — файлы-справочники: по промпту находим релевантный кусок текста
+ *                     (по абзацам, не по заголовкам) и подкладываем его в контекст.
+ *                     Пусто — выключено.
+ *   minDocScore     — сколько разных слов промпта должно совпасть с абзацем (по умолчанию 2)
+ *   maxDocBlocks    — сколько попаданий из одного файла максимум (по умолчанию 2)
+ *   docWindow       — на сколько соседних абзацев раздувать попадание (по умолчанию 1)
+ *   maxDocChars     — потолок символов из одного файла за ход (по умолчанию 8000)
  *   announce        — писать в лог, что правило вставлено (по умолчанию false)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
@@ -47,8 +56,22 @@ interface Options {
   alwaysSkills: string[]
   /** Потолок на всё, что плагин цепляет к одному промпту (база + добор). */
   maxAttach: number
+  /** Файлы-справочники: релевантный раздел уезжает в контекст целиком. */
+  documents: DocSpec[]
+  minDocScore: number
+  maxDocBlocks: number
+  docWindow: number
+  maxDocChars: number
   announce: boolean
   logFile?: string
+}
+
+/** Описание файла-справочника: путь и персональные лимиты. */
+interface DocSpec {
+  path: string
+  title?: string
+  maxBlocks?: number
+  maxChars?: number
 }
 
 /** База общения: структура ответа, живой контакт, язык без нейрослопа. */
@@ -61,6 +84,26 @@ function readOptions(raw: unknown): Options {
   const bool = (v: unknown, fallback: boolean) => (typeof v === "boolean" ? v : fallback)
   const list = (v: unknown, fallback: string[]) =>
     Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : fallback
+  const docs = (v: unknown): DocSpec[] => {
+    if (!Array.isArray(v)) return []
+    const out: DocSpec[] = []
+    for (const item of v) {
+      if (typeof item === "string" && item.length > 0) {
+        out.push({ path: item })
+        continue
+      }
+      if (!item || typeof item !== "object") continue
+      const d = item as Record<string, unknown>
+      if (typeof d.path !== "string" || d.path.length === 0) continue
+      out.push({
+        path: d.path,
+        title: typeof d.title === "string" ? d.title : undefined,
+        maxBlocks: typeof d.maxBlocks === "number" ? Math.max(1, Math.trunc(d.maxBlocks)) : undefined,
+        maxChars: typeof d.maxChars === "number" ? Math.max(200, Math.trunc(d.maxChars)) : undefined,
+      })
+    }
+    return out
+  }
   return {
     minSkills: Math.max(0, int(o.minSkills, 3)),
     maxSkills: Math.max(1, int(o.maxSkills, 5)),
@@ -73,6 +116,11 @@ function readOptions(raw: unknown): Options {
     minScore: Math.max(1, int(o.minScore, 3)),
     alwaysSkills: list(o.alwaysSkills, DEFAULT_ALWAYS),
     maxAttach: Math.max(0, int(o.maxAttach, 6)),
+    documents: docs(o.documents),
+    minDocScore: Math.max(1, int(o.minDocScore, 2)),
+    maxDocBlocks: Math.max(1, int(o.maxDocBlocks, 2)),
+    docWindow: Math.max(0, int(o.docWindow, 1)),
+    maxDocChars: Math.max(200, int(o.maxDocChars, 8000)),
     announce: bool(o.announce, false),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
@@ -98,6 +146,21 @@ function words(text: string): Set<string> {
   const out = new Set<string>()
   for (const w of text.toLowerCase().split(/[^0-9a-zа-яё]+/)) {
     if (w.length >= 4 && !STOP.has(w)) out.add(w)
+  }
+  return out
+}
+
+/**
+ * То же, но с грубым стеммингом: у слов от 6 букв берём первые 5. Русская
+ * морфология гуляет по падежам («ресёрча» / «ресёрч»), без этого не сходится.
+ * Короткие латинские токены (mcp, api, ssh) пропускаем — это имена, не мусор.
+ */
+function stemWords(text: string): Set<string> {
+  const out = new Set<string>()
+  for (const w of text.toLowerCase().split(/[^0-9a-zа-яё]+/)) {
+    const latinShort = /^[a-z0-9]{3}$/.test(w)
+    if ((w.length < 4 && !latinShort) || STOP.has(w)) continue
+    out.add(w.length >= 6 ? w.slice(0, 5) : w)
   }
   return out
 }
@@ -137,6 +200,147 @@ function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore:
   return scored.slice(0, limit).map((s) => s.id)
 }
 
+/** `~` и `~/x` — в домашний каталог. */
+function expandHome(path: string): string {
+  if (path === "~") return homedir()
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2))
+  return path
+}
+
+interface DocUnit {
+  start: number
+  end: number
+  title: string
+  text: string
+  words: Set<string>
+}
+
+interface DocPick {
+  start: number
+  title: string
+  text: string
+}
+
+const HEADING = /^(#{1,6})\s+(.+)$/
+
+/**
+ * Режет файл на абзацы (единица кончается на пустой строке), а не по заголовкам:
+ * искать надо по телу текста, структура тут только мешает. Заголовок, стоящий
+ * отдельной строкой, приклеиваем к следующему абзацу — он его подписывает.
+ */
+function splitDoc(text: string): DocUnit[] {
+  const lines = text.split(/\r?\n/)
+  const units: DocUnit[] = []
+  let start = -1
+  let buf: string[] = []
+  const flush = (end: number) => {
+    if (start < 0) return
+    const chunk = buf.join("\n").trim()
+    const from = start
+    start = -1
+    buf = []
+    if (chunk) units.push({ start: from, end, title: labelOf(chunk), text: chunk, words: stemWords(chunk) })
+  }
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === "") flush(i)
+    else {
+      if (start < 0) start = i
+      buf.push(lines[i])
+    }
+  }
+  flush(lines.length)
+
+  const merged: DocUnit[] = []
+  for (let i = 0; i < units.length; i++) {
+    const unit = units[i]
+    const next = units[i + 1]
+    if (next && isHeadingOnly(unit.text)) {
+      next.start = unit.start
+      next.text = `${unit.text}\n${next.text}`
+      next.words = stemWords(next.text)
+      next.title = labelOf(next.text)
+      continue
+    }
+    merged.push(unit)
+  }
+  return merged
+}
+
+function isHeadingOnly(text: string): boolean {
+  return text.split("\n").every((line) => HEADING.test(line.trim()))
+}
+
+/** Подпись куска: последний заголовок внутри, иначе первая строка. */
+function labelOf(text: string): string {
+  let heading: string | undefined
+  for (const line of text.split("\n")) {
+    const m = line.trim().match(HEADING)
+    if (m) heading = m[2].trim()
+  }
+  return (heading ?? text.split("\n")[0].trim()).slice(0, 80)
+}
+
+/** Обрезка по границе абзаца возле предела, чтобы не рвать фразу на полуслове. */
+function clipBlock(text: string, limit: number): string {
+  if (text.length <= limit) return text
+  const cut = text.slice(0, limit)
+  const lastParagraph = cut.lastIndexOf("\n\n")
+  return (lastParagraph > limit * 0.5 ? cut.slice(0, lastParagraph) : cut).trimEnd()
+}
+
+/**
+ * Ищет по телу абзацев, вес слова — редкость (IDF): «сервер» весит мало,
+ * «сабагент» много. `minMatches` — сколько разных слов промпта должно совпасть.
+ * Попадание расширяем на соседние абзацы (`window`), пересекающиеся окна склеиваем.
+ */
+function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limit: number, window: number): DocPick[] {
+  const promptWords = stemWords(prompt)
+  if (promptWords.size === 0 || units.length === 0) return []
+  const df = new Map<string, number>()
+  for (const unit of units) {
+    for (const w of unit.words) df.set(w, (df.get(w) ?? 0) + 1)
+  }
+  const idf = (w: string) => Math.log(1 + units.length / (df.get(w) ?? 1))
+
+  const scored = units
+    .map((unit, index) => {
+      let matches = 0
+      let score = 0
+      for (const w of promptWords) {
+        if (!unit.words.has(w)) continue
+        matches += 1
+        score += idf(w)
+      }
+      return { index, matches, score }
+    })
+    .filter((x) => x.matches >= minMatches)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+
+  const ranges: { lo: number; hi: number; best: number; score: number }[] = []
+  for (const hit of scored) {
+    if (ranges.length >= limit) break
+    const lo = Math.max(0, hit.index - window)
+    const hi = Math.min(units.length - 1, hit.index + window)
+    const touching = ranges.find((r) => lo <= r.hi + 1 && r.lo <= hi + 1)
+    if (touching) {
+      touching.lo = Math.min(touching.lo, lo)
+      touching.hi = Math.max(touching.hi, hi)
+      if (hit.score > touching.score) {
+        touching.score = hit.score
+        touching.best = hit.index
+      }
+      continue
+    }
+    ranges.push({ lo, hi, best: hit.index, score: hit.score })
+  }
+  ranges.sort((a, b) => a.lo - b.lo)
+  return ranges.map((r) => ({
+    start: units[r.lo].start,
+    title: units[r.best].title,
+    text: units.slice(r.lo, r.hi + 1).map((u) => u.text).join("\n\n"),
+  }))
+}
+
 function renderRule(
   min: number,
   max: number,
@@ -172,6 +376,10 @@ export default Plugin.define({
     const inContact = new Map<string, Set<string>>()
     /** sessionID -> рабочие скиллы, попавшие в контекст в текущем ходе (для счётчика «минимум N»). */
     const turnTask = new Map<string, Set<string>>()
+    /** путь -> разобранный файл-справочник (кэш по mtime). */
+    const docCache = new Map<string, { mtimeMs: number; units: DocUnit[] }>()
+    /** sessionID -> какие разделы справочников уже подставлены (чтобы не дублировать). */
+    const injectedDocs = new Map<string, Set<string>>()
 
     const note = (message: string) => {
       const line = `${new Date().toISOString()} ${TAG} ${message}\n`
@@ -197,6 +405,47 @@ export default Plugin.define({
       }
     }
 
+    /**
+     * Подбирает по промпту разделы из файлов-справочников. Возвращает готовые куски
+     * для вставки в сообщение; один и тот же раздел в сессии не повторяем.
+     */
+    const docsFor = (prompt: string, sessionID: string): string[] => {
+      const seen = injectedDocs.get(sessionID) ?? new Set<string>()
+      injectedDocs.set(sessionID, seen)
+      const chunks: string[] = []
+      for (const spec of options.documents) {
+        const path = expandHome(spec.path)
+        let cached = docCache.get(path)
+        try {
+          const mtimeMs = statSync(path).mtimeMs
+          if (!cached || cached.mtimeMs !== mtimeMs) {
+            cached = { mtimeMs, units: splitDoc(readFileSync(path, "utf8")) }
+            docCache.set(path, cached)
+          }
+        } catch (error) {
+          note(`doc read failed ${path}: ${String(error)}`)
+          continue
+        }
+        const limit = spec.maxBlocks ?? options.maxDocBlocks
+        const budget = spec.maxChars ?? options.maxDocChars
+        const label = spec.title ?? spec.path
+        let used = 0
+        let added = 0
+        for (const block of selectBlocks(prompt, cached.units, options.minDocScore, limit, options.docWindow)) {
+          const key = `${path}#${block.start}`
+          if (seen.has(key) || used >= budget) continue
+          const piece = clipBlock(block.text, budget - used)
+          if (piece.length === 0) continue
+          chunks.push(`[${label} — «${block.title}»]\n${piece}`)
+          seen.add(key)
+          used += piece.length
+          added += 1
+        }
+        note(`doc ${path}: ${cached.units.length} units, added ${added}, ${used} chars`)
+      }
+      return chunks
+    }
+
     ctx.session.hook("prompt", async (event) => {
       try {
         const sessionID = event.sessionID
@@ -206,10 +455,22 @@ export default Plugin.define({
         inContact.set(sessionID, contact)
         turnTask.set(sessionID, new Set())
 
+        const text = event.prompt.text ?? ""
+        const substantive = text.trim().length >= options.minPromptChars
+
+        // справочники: релевантный раздел уезжает в контекст целиком; включается списком documents
+        if (substantive && options.documents.length > 0) {
+          const chunks = docsFor(text, sessionID)
+          if (chunks.length > 0) {
+            const labels = options.documents.map((d) => d.path).join(", ")
+            event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
+            note(`doc-inject: ${chunks.length} section(s), ${chunks.reduce((n, c) => n + c.length, 0)} chars (session ${sessionID})`)
+          }
+        }
+
         if (!options.autoAttach) return
         if (!options.attachAlways && !options.attachPicked) return
-        const text = event.prompt.text ?? ""
-        if (text.trim().length < options.minPromptChars) return
+        if (!substantive) return
 
         const all = await skillsAtHand()
         if (all.length === 0) return
