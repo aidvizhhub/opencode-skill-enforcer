@@ -16,7 +16,7 @@
   "plugins": [
     {
       "package": "~/Projects/GithubPublic/opencode-skill-enforcer",
-      "options": { "minSkills": 3, "maxSkills": 5, "attachAlways": true, "attachPicked": true }
+      "options": { "minSkills": 3, "maxSkills": 5, "attachAlways": true, "attachPicked": true, "skillLlm": true }
     }
   ]
 }
