@@ -17,7 +17,9 @@ import { Plugin } from "@opencode/plugin"
  * Опции (через объектную форму в plugins):
  *   minSkills       — сколько скиллов минимум на ход (по умолчанию 3)
  *   maxSkills       — верхняя граница авто-подбора (по умолчанию 5)
- *   autoAttach      — прикреплять подобранные скиллы к промпту (по умолчанию true)
+ *   autoAttach      — мастер-выключатель автоприцепки (по умолчанию true)
+ *   attachAlways    — цеплять базовый набор общения (по умолчанию true)
+ *   attachPicked    — цеплять добор по смыслу запроса (по умолчанию true)
  *   padToMin        — добивать авто-подбор до minSkills даже без совпадений (по умолчанию false)
  *   defaultSkills   — список ID для добивки, когда padToMin включён
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
@@ -31,7 +33,12 @@ const TAG = "[skill-enforcer]"
 interface Options {
   minSkills: number
   maxSkills: number
+  /** Мастер-выключатель всей автоприцепки. false — остаётся только правило-напоминание. */
   autoAttach: boolean
+  /** Цеплять базовый набор общения (alwaysSkills). */
+  attachAlways: boolean
+  /** Цеплять добор по смыслу запроса. */
+  attachPicked: boolean
   padToMin: boolean
   defaultSkills: string[]
   minPromptChars: number
@@ -58,6 +65,8 @@ function readOptions(raw: unknown): Options {
     minSkills: Math.max(0, int(o.minSkills, 3)),
     maxSkills: Math.max(1, int(o.maxSkills, 5)),
     autoAttach: bool(o.autoAttach, true),
+    attachAlways: bool(o.attachAlways, true),
+    attachPicked: bool(o.attachPicked, true),
     padToMin: bool(o.padToMin, false),
     defaultSkills: list(o.defaultSkills, []),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
@@ -186,6 +195,7 @@ export default Plugin.define({
         turnTask.set(sessionID, new Set())
 
         if (!options.autoAttach) return
+        if (!options.attachAlways && !options.attachPicked) return
         const text = event.prompt.text ?? ""
         if (text.trim().length < options.minPromptChars) return
 
@@ -197,25 +207,29 @@ export default Plugin.define({
         const taskAttached: string[] = []
 
         // база общения — обязательна, цепляем один раз за сессию
-        for (const id of options.alwaysSkills) {
-          if (atCap()) break
-          if (!available.has(id) || contact.has(id) || attach.includes(id)) continue
-          attach.push(id)
+        if (options.attachAlways) {
+          for (const id of options.alwaysSkills) {
+            if (atCap()) break
+            if (!available.has(id) || contact.has(id) || attach.includes(id)) continue
+            attach.push(id)
+          }
         }
 
         // добор по смыслу текущего запроса
-        const matched = pickSkills(text, all, options.maxSkills, options.minScore)
-        if (options.padToMin && matched.length < options.minSkills) {
-          for (const id of options.defaultSkills) {
-            if (matched.length >= options.minSkills) break
-            if (!matched.includes(id)) matched.push(id)
+        if (options.attachPicked) {
+          const matched = pickSkills(text, all, options.maxSkills, options.minScore)
+          if (options.padToMin && matched.length < options.minSkills) {
+            for (const id of options.defaultSkills) {
+              if (matched.length >= options.minSkills) break
+              if (!matched.includes(id)) matched.push(id)
+            }
           }
-        }
-        for (const id of matched) {
-          if (atCap()) break
-          if (contact.has(id) || attach.includes(id)) continue
-          attach.push(id)
-          taskAttached.push(id)
+          for (const id of matched) {
+            if (atCap()) break
+            if (contact.has(id) || attach.includes(id)) continue
+            attach.push(id)
+            taskAttached.push(id)
+          }
         }
 
         if (attach.length === 0) return
@@ -245,7 +259,7 @@ export default Plugin.define({
       }
     })
 
-    note(`loaded: min=${options.minSkills} max=${options.maxSkills} always=${options.alwaysSkills.join(",") || "-"} autoAttach=${options.autoAttach}`)
+    note(`loaded: min=${options.minSkills} max=${options.maxSkills} always=${options.alwaysSkills.join(",") || "-"} attach=always:${options.attachAlways},picked:${options.attachPicked}`)
 
     ctx.tool.hook("execute.before", (event) => {
       try {
