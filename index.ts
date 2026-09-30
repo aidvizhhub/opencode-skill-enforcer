@@ -236,12 +236,8 @@ interface DocPick {
 
 const HEADING = /^(#{1,6})\s+(.+)$/
 
-/**
- * Режет файл на абзацы (единица кончается на пустой строке), а не по заголовкам:
- * искать надо по телу текста, структура тут только мешает. Заголовок, стоящий
- * отдельной строкой, приклеиваем к следующему абзацу — он его подписывает.
- */
-function splitDoc(text: string): DocUnit[] {
+/** Абзацы файла: единица кончается на пустой строке, код и списки не рвём. */
+function atomsOf(text: string): DocUnit[] {
   const lines = text.split(/\r?\n/)
   const units: DocUnit[] = []
   let start = -1
@@ -300,6 +296,49 @@ function splitDoc(text: string): DocUnit[] {
     merged.push(unit)
   }
   return merged
+}
+
+/** Целевой размер блока: меньше — огрызок, больше — лишний вес. */
+const DOC_BLOCK_MIN = 600
+const DOC_BLOCK_MAX = 1200
+
+/**
+ * Режет файл на блоки по размеру: копим абзацы, пока блок не станет весомым.
+ * Новый блок начинаем у заголовка (если минимум уже набран) или по достижении
+ * максимума. Так вместо сотни огрызков выходят нормальные куски текста.
+ */
+function splitDoc(text: string): DocUnit[] {
+  const atoms = atomsOf(text)
+  const blocks: DocUnit[] = []
+  let parts: string[] = []
+  let start = -1
+  let end = -1
+  let title = ""
+  const size = () => parts.reduce((n, p) => n + p.length + 2, 0)
+  const flush = () => {
+    if (!parts.length) return
+    const chunk = parts.join("\n\n")
+    blocks.push({
+      start,
+      end,
+      title: title || chunk.split("\n")[0].trim().slice(0, 80),
+      text: chunk,
+      words: stemWords(chunk),
+    })
+    parts = []
+  }
+  for (const atom of atoms) {
+    const sectionStart = HEADING.test(atom.text.split("\n")[0].trim())
+    if (parts.length > 0 && ((sectionStart && size() >= DOC_BLOCK_MIN) || size() >= DOC_BLOCK_MAX)) flush()
+    if (parts.length === 0) {
+      start = atom.start
+      title = atom.title
+    }
+    parts.push(atom.text)
+    end = atom.end
+  }
+  flush()
+  return blocks
 }
 
 function isHeadingOnly(text: string): boolean {
@@ -573,9 +612,8 @@ export default Plugin.define({
       }
     }
 
-    const docsFor = async (prompt: string, sessionID: string): Promise<string[]> => {
+    const docsFor = async (prompt: string, sessionID: string, history: string | null): Promise<string[]> => {
       const seen = await loadSeen(sessionID)
-      const history = options.documents.length > 0 ? await recentHistory(sessionID) : null
       const chunks: string[] = []
       let dirty = false
       for (const spec of options.documents) {
@@ -640,10 +678,14 @@ export default Plugin.define({
 
         const text = event.prompt.text ?? ""
         const substantive = text.trim().length >= options.minPromptChars
+        const history = substantive ? await recentHistory(sessionID) : null
+        // скилл уже в контексте сессии? Проверяем по истории (после сжатия вернём заново)
+        const skillInContext = (id: string) =>
+          history !== null ? new RegExp(`/skills/${id}(\\b|/)`).test(history) : contact.has(id)
 
         // справочники: релевантный раздел уезжает в контекст целиком; включается списком documents
         if (substantive && options.documents.length > 0) {
-          const chunks = await docsFor(text, sessionID)
+          const chunks = await docsFor(text, sessionID, history)
           if (chunks.length > 0) {
             const labels = options.documents.map((d) => d.path).join(", ")
             event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
@@ -668,7 +710,7 @@ export default Plugin.define({
         if (options.attachAlways) {
           for (const id of options.alwaysSkills) {
             if (atCap()) break
-            if (!available.has(id) || contact.has(id) || attach.includes(id)) continue
+            if (!available.has(id) || skillInContext(id) || attach.includes(id)) continue
             attach.push(id)
           }
         }
@@ -684,7 +726,7 @@ export default Plugin.define({
           }
           for (const id of matched) {
             if (atCap()) break
-            if (contact.has(id) || attach.includes(id)) continue
+            if (skillInContext(id) || attach.includes(id)) continue
             attach.push(id)
             taskAttached.push(id)
           }
@@ -694,7 +736,7 @@ export default Plugin.define({
         if (options.skillLlm && taskAttached.length < options.minSkills) {
           try {
             const need = options.minSkills - taskAttached.length
-            const candidates = all.filter((s) => !contact.has(s.id) && !attach.includes(s.id))
+            const candidates = all.filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
             const picked = await llmPickSkills(text, candidates, (t) => askModel(t, sessionID), need, note)
             for (const id of picked) {
               if (atCap()) break
@@ -708,10 +750,11 @@ export default Plugin.define({
           }
         }
 
-        const touched = new Set(contact)
-        for (const id of attach) touched.add(id)
-        const untouched = [...available].filter((id) => !touched.has(id))
-        note(`coverage: ${touched.size}/${available.size} скиллов; не трогали: ${untouched.join(", ") || "—"}`)
+        // покрытие считаем по факту: что лежит в контексте сессии плюс что цепляем сейчас
+        const touched = new Set<string>()
+        for (const s of all) if (skillInContext(s.id) || attach.includes(s.id)) touched.add(s.id)
+        const untouched = all.map((s) => s.id).filter((id) => !touched.has(id))
+        note(`coverage: ${touched.size}/${all.length} скиллов; не трогали: ${untouched.join(", ") || "—"}`)
 
         if (attach.length === 0) return
 
