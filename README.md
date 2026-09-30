@@ -2,28 +2,28 @@
 
 Плагин для OpenCode V2: не даёт агенту игнорировать скиллы.
 
-- **Каждый шаг модели** правило висит в system: сверься со скиллами, загрузи минимум N,
-  уже загруженные — соблюдай.
-- **На входе сообщения** подбирает скиллы по смыслу промпта и прикрепляет их к контексту.
-- **Считает** реальные вызовы инструмента `skill`, чтобы правило знало, сколько уже загружено.
+- **Каждый шаг модели** (`session.hook("context")`) в system добавляется короткое правило:
+  сверься со скиллами, загрузи минимум N, а уже загруженные — соблюдай.
+- **На входе сообщения** (`session.hook("prompt")`) подбирает скиллы по смыслу промпта
+  и прикрепляет их к контексту, чтобы они реально попали в ход.
+- **Считает** вызовы инструмента `skill` (`tool.hook("execute.before")`), поэтому правило
+  знает, сколько уже загружено, и говорит «следуй загруженному».
 
 ## Установка
 
-Глобально (действует во всех проектах) — папкой в каталоге плагинов OpenCode:
-
-```bash
-ln -s ~/Projects/opencode-skill-enforcer ~/.config/opencode/plugins/skill-enforcer
-```
-
-Или явно в `opencode.json(c)`:
+Добавить в глобальный `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 {
   "plugins": [
-    { "package": "~/Projects/GithubPublic/opencode-skill-enforcer", "options": { "minSkills": 3 } }
+    { "package": "~/Projects/GithubPublic/opencode-skill-enforcer",
+      "options": { "minSkills": 3, "maxSkills": 5, "autoAttach": true } }
   ]
 }
 ```
+
+Плагин подхватывается без перезапуска сервиса. Если по какой-то причине нет —
+`opencode service restart`.
 
 ## Опции
 
@@ -35,14 +35,27 @@ ln -s ~/Projects/opencode-skill-enforcer ~/.config/opencode/plugins/skill-enforc
 | `padToMin` | `false` | Добивать подбор до `minSkills` даже без совпадений |
 | `defaultSkills` | `[]` | ID для добивки, когда включён `padToMin` |
 | `minPromptChars` | `12` | Не трогать короткие реплики |
-| `announce` | `false` | Писать в лог, что правило вставлено |
+| `minScore` | `3` | Порог совпадения: триггер весит 2, описание 1; ниже порога скилл не цепляется |
+| `announce` | `false` | Писать события в stderr сервера |
+| `logFile` | — | Писать события в файл (диагностика) |
 
-## Проверка
+`autoAttach` прикрепляет тела скиллов к контексту — это расход токенов. Хочешь только
+напоминание без автоподбора — `"autoAttach": false`.
 
-Плагин пишет метки `[skill-enforcer]` в лог сервера:
+## Диагностика
+
+События (`loaded`, `attached`, `injected rule`) пишутся либо в `options.logFile`,
+либо в файл из переменной `SKILL_ENFORCER_DEBUG`:
 
 ```bash
-grep skill-enforcer ~/.local/share/opencode/log/opencode.log | tail
+SKILL_ENFORCER_DEBUG=/tmp/skill-enforcer.log opencode run -m <model> "тест"
+tail -f /tmp/skill-enforcer.log
 ```
 
-Метки появляются только при `announce: true`.
+## Разработка
+
+```bash
+npm install
+npx tsc --noEmit      # типы
+bun build index.ts --target=bun --outfile=/tmp/se.js   # сборка
+```

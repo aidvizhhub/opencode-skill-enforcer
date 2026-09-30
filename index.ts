@@ -21,6 +21,7 @@ import { Plugin } from "@opencode/plugin"
  *   padToMin        — добивать авто-подбор до minSkills даже без совпадений (по умолчанию false)
  *   defaultSkills   — список ID для добивки, когда padToMin включён
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
+ *   minScore        — порог совпадения для авто-подбора; триггер весит 2, описание 1 (по умолчанию 3)
  *   announce        — писать в лог, что правило вставлено (по умолчанию false)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
@@ -34,6 +35,7 @@ interface Options {
   padToMin: boolean
   defaultSkills: string[]
   minPromptChars: number
+  minScore: number
   announce: boolean
   logFile?: string
 }
@@ -52,6 +54,7 @@ function readOptions(raw: unknown): Options {
     padToMin: bool(o.padToMin, false),
     defaultSkills: list(o.defaultSkills, []),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
+    minScore: Math.max(1, int(o.minScore, 3)),
     announce: bool(o.announce, false),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
@@ -59,37 +62,58 @@ function readOptions(raw: unknown): Options {
   }
 }
 
-/** Значимые слова (от 4 букв) в нижнем регистре — по ним сопоставляем промпт и скилл. */
+/** Слова, которые не считаем за совпадение — они есть почти в любом скилле. */
+const STOP = new Set([
+  "что", "чтобы", "чтоб", "как", "когда", "зачем", "почему", "если", "или", "для",
+  "тебя", "меня", "него", "нее", "них", "нам", "вам", "это", "этот", "эта", "эти",
+  "все", "всё", "дает", "дать", "будет", "было", "есть", "надо", "нужно", "можно",
+  "ещё", "еще", "уже", "даже", "тоже", "также", "просто", "только", "очень", "самый",
+  "такой", "такая", "такое", "такие", "делать", "сделать", "делай", "хочешь", "хочет",
+  "скилл", "скиллы", "скиллов", "скиллам", "skills", "skill", "workflow", "tool", "tools",
+  "which", "what", "when", "where", "with", "from", "this", "that", "these", "those",
+  "your", "yours", "have", "make", "want", "need", "just", "like", "does", "doing",
+  "the", "and", "for", "not", "are", "was", "were", "will", "would", "should",
+])
+
+/** Значимые слова (от 4 букв, без стоп-слов) в нижнем регистре. */
 function words(text: string): Set<string> {
   const out = new Set<string>()
   for (const w of text.toLowerCase().split(/[^0-9a-zа-яё]+/)) {
-    if (w.length >= 4) out.add(w)
+    if (w.length >= 4 && !STOP.has(w)) out.add(w)
   }
   return out
 }
 
 interface SkillRef {
   id: string
-  haystack: string
+  /** Слова из ID и из секции «Загружай, когда:» — вес 2. */
+  trigger: Set<string>
+  /** Остальное описание (кроме «Не грузи, когда:») — вес 1. */
+  body: Set<string>
 }
 
 function referenceOf(skill: { id: string; name?: string; description?: string }): SkillRef {
+  const description = skill.description ?? ""
+  const [beforeNegative] = description.split(/Не грузи/i)
+  const parts = beforeNegative.split(/Загружай,?\s*когда:?/i)
+  const triggerText = parts.length > 1 ? parts.slice(1).join(" ") : ""
+  const bodyText = parts[0] ?? ""
   return {
     id: skill.id,
-    haystack: `${skill.id} ${skill.name ?? ""} ${skill.description ?? ""}`.toLowerCase(),
+    trigger: words(`${skill.id} ${skill.name ?? ""} ${triggerText}`),
+    body: words(bodyText),
   }
 }
 
-function pickSkills(prompt: string, skills: SkillRef[], limit: number): string[] {
+function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore: number): string[] {
   const promptWords = words(prompt)
   if (promptWords.size === 0) return []
   const scored: { id: string; score: number }[] = []
   for (const skill of skills) {
     let score = 0
-    for (const w of words(skill.haystack)) {
-      if (promptWords.has(w)) score += 1
-    }
-    if (score > 0) scored.push({ id: skill.id, score })
+    for (const w of skill.trigger) if (promptWords.has(w)) score += 2
+    for (const w of skill.body) if (promptWords.has(w)) score += 1
+    if (score >= minScore) scored.push({ id: skill.id, score })
   }
   scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
   return scored.slice(0, limit).map((s) => s.id)
@@ -142,7 +166,10 @@ export default Plugin.define({
     ctx.session.hook("prompt", async (event) => {
       try {
         const sessionID = event.sessionID
-        loadedThisTurn.set(sessionID, new Set())
+        const current = event.prompt.skills ?? []
+        // в «контакте» с начала хода считаем и пред-выбранные скиллы, и то, что доцеп им сами
+        const inContact = new Set(current.map((s) => String(s.id)))
+        loadedThisTurn.set(sessionID, inContact)
 
         if (!options.autoAttach) return
         const text = event.prompt.text ?? ""
@@ -151,7 +178,7 @@ export default Plugin.define({
         const refs = await skillsAtHand()
         if (refs.length === 0) return
 
-        const picked = pickSkills(text, refs, options.maxSkills)
+        const picked = pickSkills(text, refs, options.maxSkills, options.minScore)
         if (options.padToMin && picked.length < options.minSkills) {
           for (const id of options.defaultSkills) {
             if (picked.length >= options.minSkills) break
@@ -160,12 +187,11 @@ export default Plugin.define({
         }
         if (picked.length === 0) return
 
-        const current = event.prompt.skills ?? []
-        const have = new Set(current.map((s) => String(s.id)))
-        const added = picked.filter((id) => !have.has(id))
+        const added = picked.filter((id) => !inContact.has(id))
         if (added.length === 0) return
 
         event.prompt.skills = [...current, ...added.map((id) => ({ id }) as never)]
+        for (const id of added) inContact.add(id)
         note(`attached: ${added.join(", ")} (session ${sessionID})`)
       } catch (error) {
         note(`prompt hook failed: ${String(error)}`)
