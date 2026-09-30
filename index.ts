@@ -23,8 +23,6 @@ import { Plugin } from "@opencode/plugin"
  *   attachAlways    — цеплять базовый набор общения (по умолчанию true)
  *   attachPicked    — цеплять добор по смыслу запроса (по умолчанию true)
  *   skillLlm        — если словесный добор недобрал до minSkills, спросить модель (по умолчанию false)
- *   padToMin        — добивать авто-подбор до minSkills даже без совпадений (по умолчанию false)
- *   defaultSkills   — список ID для добивки, когда padToMin включён
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
  *   minScore        — порог совпадения для авто-подбора; триггер весит 2, описание 1 (по умолчанию 3)
  *   documents       — файлы-справочники: по промпту находим релевантный кусок текста
@@ -36,7 +34,6 @@ import { Plugin } from "@opencode/plugin"
  *   maxDocChars     — потолок символов из одного файла за ход (по умолчанию 8000)
  *   docLlm          — семантический добор: если словесный поиск пуст, спросить модель (по умолчанию false)
  *   docLlmMax       — сколько абзацев показывать модели на выбор (по умолчанию 300)
- *   announce        — писать в лог, что правило вставлено (по умолчанию false)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
 
@@ -53,8 +50,6 @@ interface Options {
   attachPicked: boolean
   /** Семантический добор скиллов через модель, когда словесный недобрал. */
   skillLlm: boolean
-  padToMin: boolean
-  defaultSkills: string[]
   minPromptChars: number
   minScore: number
   /** Скиллы «человеческого общения», которые держим в контакте всегда (цепляем один раз за сессию). */
@@ -69,7 +64,6 @@ interface Options {
   maxDocChars: number
   docLlm: boolean
   docLlmMax: number
-  announce: boolean
   logFile?: string
 }
 
@@ -118,8 +112,6 @@ function readOptions(raw: unknown): Options {
     attachAlways: bool(o.attachAlways, true),
     attachPicked: bool(o.attachPicked, true),
     skillLlm: bool(o.skillLlm, false),
-    padToMin: bool(o.padToMin, false),
-    defaultSkills: list(o.defaultSkills, []),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
     minScore: Math.max(1, int(o.minScore, 3)),
     alwaysSkills: list(o.alwaysSkills, DEFAULT_ALWAYS),
@@ -131,7 +123,6 @@ function readOptions(raw: unknown): Options {
     maxDocChars: Math.max(200, int(o.maxDocChars, 8000)),
     docLlm: bool(o.docLlm, false),
     docLlmMax: Math.max(10, int(o.docLlmMax, 300)),
-    announce: bool(o.announce, false),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
       : process.env.SKILL_ENFORCER_DEBUG || undefined,
@@ -548,40 +539,11 @@ export default Plugin.define({
     const turnTask = new Map<string, Set<string>>()
     /** путь -> разобранный файл-справочник (кэш по mtime). */
     const docCache = new Map<string, { mtimeMs: number; units: DocUnit[] }>()
-    /** sessionID -> какие разделы справочников уже подставлены (кэш поверх durable-хранилища). */
+    /** sessionID -> какие куски справочников уже подставлены (фолбэк, когда история недоступна). */
     const injectedDocs = new Map<string, Set<string>>()
-    const seenKey = (sessionID: string) => `injected/${sessionID}`
-
-    /** Читает список подставленного: сначала память, потом ctx.storage (переживает reload). */
-    const loadSeen = async (sessionID: string): Promise<Set<string>> => {
-      const cached = injectedDocs.get(sessionID)
-      if (cached) return cached
-      const set = new Set<string>()
-      try {
-        const raw = await ctx.storage.get(seenKey(sessionID))
-        if (Array.isArray(raw)) {
-          for (const item of raw) if (typeof item === "string") set.add(item)
-        }
-      } catch (error) {
-        note(`doc storage get failed: ${String(error)}`)
-      }
-      injectedDocs.set(sessionID, set)
-      return set
-    }
-
-    /** Пишет список подставленного в ctx.storage; длинный список подрезаем. */
-    const saveSeen = async (sessionID: string, set: Set<string>): Promise<void> => {
-      const list = [...set].slice(-400)
-      try {
-        await ctx.storage.set(seenKey(sessionID), list)
-      } catch (error) {
-        note(`doc storage set failed: ${String(error)}`)
-      }
-    }
 
     const note = (message: string) => {
       const line = `${new Date().toISOString()} ${TAG} ${message}\n`
-      if (options.announce) console.error(line.trimEnd())
       if (options.logFile) {
         try {
           appendFileSync(options.logFile, line)
@@ -702,12 +664,6 @@ export default Plugin.define({
         }
         if (options.attachPicked) {
           const matched = pickSkills(text, all, options.maxSkills, options.minScore)
-          if (options.padToMin && matched.length < options.minSkills) {
-            for (const id of options.defaultSkills) {
-              if (matched.length >= options.minSkills) break
-              if (!matched.includes(id)) matched.push(id)
-            }
-          }
           for (const id of matched) {
             if (atCap()) break
             if (skillInContext(id) || attach.includes(id)) continue
@@ -774,9 +730,9 @@ export default Plugin.define({
 
         // вставка кусков справочников
         if (plans.length > 0) {
-          const seen = await loadSeen(sessionID)
+          const seen = injectedDocs.get(sessionID) ?? new Set<string>()
+          injectedDocs.set(sessionID, seen)
           const chunks: string[] = []
-          let dirty = false
           for (const plan of plans) {
             let used = 0
             let added = 0
@@ -795,13 +751,11 @@ export default Plugin.define({
               if (piece.length === 0) continue
               chunks.push(`${header}\n${piece}`)
               seen.add(key)
-              dirty = true
               used += piece.length
               added += 1
             }
             note(`doc ${plan.path}: ${plan.units.length} units, added ${added}, ${used} chars`)
           }
-          if (dirty) await saveSeen(sessionID, seen)
           if (chunks.length > 0) {
             const labels = options.documents.map((d) => d.path).join(", ")
             event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
