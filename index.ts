@@ -431,8 +431,36 @@ export default Plugin.define({
     const turnTask = new Map<string, Set<string>>()
     /** путь -> разобранный файл-справочник (кэш по mtime). */
     const docCache = new Map<string, { mtimeMs: number; units: DocUnit[] }>()
-    /** sessionID -> какие разделы справочников уже подставлены (чтобы не дублировать). */
+    /** sessionID -> какие разделы справочников уже подставлены (кэш поверх durable-хранилища). */
     const injectedDocs = new Map<string, Set<string>>()
+    const seenKey = (sessionID: string) => `injected/${sessionID}`
+
+    /** Читает список подставленного: сначала память, потом ctx.storage (переживает reload). */
+    const loadSeen = async (sessionID: string): Promise<Set<string>> => {
+      const cached = injectedDocs.get(sessionID)
+      if (cached) return cached
+      const set = new Set<string>()
+      try {
+        const raw = await ctx.storage.get(seenKey(sessionID))
+        if (Array.isArray(raw)) {
+          for (const item of raw) if (typeof item === "string") set.add(item)
+        }
+      } catch (error) {
+        note(`doc storage get failed: ${String(error)}`)
+      }
+      injectedDocs.set(sessionID, set)
+      return set
+    }
+
+    /** Пишет список подставленного в ctx.storage; длинный список подрезаем. */
+    const saveSeen = async (sessionID: string, set: Set<string>): Promise<void> => {
+      const list = [...set].slice(-400)
+      try {
+        await ctx.storage.set(seenKey(sessionID), list)
+      } catch (error) {
+        note(`doc storage set failed: ${String(error)}`)
+      }
+    }
 
     const note = (message: string) => {
       const line = `${new Date().toISOString()} ${TAG} ${message}\n`
@@ -469,9 +497,9 @@ export default Plugin.define({
      * для вставки в сообщение; один и тот же раздел в сессии не повторяем.
      */
     const docsFor = async (prompt: string, sessionID: string): Promise<string[]> => {
-      const seen = injectedDocs.get(sessionID) ?? new Set<string>()
-      injectedDocs.set(sessionID, seen)
+      const seen = await loadSeen(sessionID)
       const chunks: string[] = []
+      let dirty = false
       for (const spec of options.documents) {
         const path = expandHome(spec.path)
         let cached = docCache.get(path)
@@ -506,11 +534,13 @@ export default Plugin.define({
           if (piece.length === 0) continue
           chunks.push(`[${label} — «${block.title}»]\n${piece}`)
           seen.add(key)
+          dirty = true
           used += piece.length
           added += 1
         }
         note(`doc ${path}: ${cached.units.length} units, added ${added}, ${used} chars`)
       }
+      if (dirty) await saveSeen(sessionID, seen)
       return chunks
     }
 
