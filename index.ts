@@ -366,8 +366,9 @@ async function llmSelect(
   limit: number,
   window: number,
   maxCandidates: number,
+  log?: (message: string) => void,
 ): Promise<DocPick[]> {
-  const preview = (unit: DocUnit) => unit.text.split("\n")[0].slice(0, 120)
+  const preview = (unit: DocUnit) => unit.text.split("\n").slice(0, 3).join(" ").slice(0, 200)
   let candidates = units.map((unit, index) => ({ unit, index }))
   if (candidates.length > maxCandidates) {
     const promptWords = new Set([...stemWords(prompt), ...words(prompt)])
@@ -386,6 +387,7 @@ async function llmSelect(
     listing,
   ].join("\n")
   const answer = await generate(ask)
+  log?.(`raw: ${answer.replace(/\s+/g, " ").slice(0, 160)}`)
   const indices = (answer.match(/\d+/g) ?? []).map(Number).filter((n) => n >= 0 && n < candidates.length)
   if (indices.length === 0) return []
   const hits = indices.slice(0, limit).map((n, order) => ({ index: candidates[n].index, score: 1 - order / 100 }))
@@ -489,7 +491,7 @@ export default Plugin.define({
         let picks = selectBlocks(prompt, cached.units, options.minDocScore, limit, options.docWindow)
         if (picks.length === 0 && options.docLlm) {
           try {
-            picks = await llmSelect(prompt, cached.units, (t) => askModel(t, sessionID), limit, options.docWindow, options.docLlmMax)
+            picks = await llmSelect(prompt, cached.units, (t) => askModel(t, sessionID), limit, options.docWindow, options.docLlmMax, note)
             note(`doc llm: picked ${picks.length} (${path}) ${picks.map((p) => p.title).join(" | ")}`)
           } catch (error) {
             note(`doc llm failed ${path}: ${String(error)}`)
