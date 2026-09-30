@@ -137,10 +137,22 @@ function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore:
   return scored.slice(0, limit).map((s) => s.id)
 }
 
-function renderRule(min: number, max: number, taskLoaded: number, taskInContact: string[], base: string[]): string {
-  const baseLine = base.length > 0
-    ? `Базовые скиллы общения держим в контакте всегда: ${base.join(", ")}. Не отвечай вопреки им.`
-    : "Базовых скиллов общения не задано."
+function renderRule(
+  min: number,
+  max: number,
+  taskLoaded: number,
+  taskInContact: string[],
+  baseInContact: string[],
+  configuredBase: string[],
+): string {
+  let baseLine: string
+  if (baseInContact.length > 0) {
+    baseLine = `Базовые скиллы общения держим в контакте всегда: ${baseInContact.join(", ")}. Не отвечай вопреки им.`
+  } else if (configuredBase.length > 0) {
+    baseLine = `Базовый набор общения (${configuredBase.join(", ")}) ещё не в контакте — загрузи его через skill, если отвечаешь живым текстом.`
+  } else {
+    baseLine = "Базовых скиллов общения не задано."
+  }
   const contactLine = taskInContact.length === 0
     ? "Рабочих скиллов в контакте пока нет — загрузи первым делом, прежде чем отвечать по существу."
     : `Уже в контакте по задаче: ${taskInContact.join(", ")}. Следуй им и не перезагружай без нужды; сменилась задача — добери по теме.`
@@ -251,7 +263,7 @@ export default Plugin.define({
         const base = options.alwaysSkills.filter((id) => contact.has(id))
         const task = [...contact].filter((id) => !base.includes(id))
         const loaded = turnTask.get(event.sessionID)?.size ?? 0
-        const rule = renderRule(options.minSkills, options.maxSkills, loaded, task, base)
+        const rule = renderRule(options.minSkills, options.maxSkills, loaded, task, base, options.alwaysSkills)
         event.system.push({ type: "text", text: rule } as never)
         note(`injected rule: session=${event.sessionID} base=${base.length} task=${task.length}`)
       } catch (error) {
