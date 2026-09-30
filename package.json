@@ -1,9 +1,19 @@
 {
   "name": "opencode-skill-enforcer",
   "version": "0.1.0",
+  "description": "OpenCode V2 plugin: attaches relevant skills and documentation chunks to every prompt and makes the agent actually load them",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aidvizhhub/opencode-skill-enforcer.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "skills", "context", "llm"],
   "exports": {
     ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.18"

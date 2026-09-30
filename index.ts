@@ -34,6 +34,9 @@ import { Plugin } from "@opencode/plugin"
  *   maxDocChars     — потолок символов из одного файла за ход (по умолчанию 8000)
  *   docLlm          — семантический добор: если словесный поиск пуст, спросить модель (по умолчанию false)
  *   docLlmMax       — сколько абзацев показывать модели на выбор (по умолчанию 300)
+ *   skillLlmMax     — сколько скиллов показывать модели на выбор; берём только те, у кого
+ *                     есть словесное совпадение с запросом (по умолчанию 12)
+ *   brokerHints     — указания брокеру под свой набор скиллов (по умолчанию пусто)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
 
@@ -64,6 +67,10 @@ interface Options {
   maxDocChars: number
   docLlm: boolean
   docLlmMax: number
+  /** Сколько скиллов-кандидатов показывать модели (только с лексическим совпадением). */
+  skillLlmMax: number
+  /** Указания брокеру под свой набор скиллов: «правка кода — вот этот скилл». */
+  brokerHints: string
   logFile?: string
 }
 
@@ -75,8 +82,8 @@ interface DocSpec {
   maxChars?: number
 }
 
-/** База общения: структура ответа, живой контакт, язык без нейрослопа. */
-const DEFAULT_ALWAYS = ["result-first", "dialog-humanity", "anti-ai-sludge"]
+/** База общения под конкретного человека: имена скиллов у каждого свои. */
+const DEFAULT_ALWAYS: string[] = []
 
 function readOptions(raw: unknown): Options {
   const o = (raw ?? {}) as Record<string, unknown>
@@ -123,6 +130,8 @@ function readOptions(raw: unknown): Options {
     maxDocChars: Math.max(200, int(o.maxDocChars, 8000)),
     docLlm: bool(o.docLlm, false),
     docLlmMax: Math.max(10, int(o.docLlmMax, 300)),
+    skillLlmMax: Math.max(3, int(o.skillLlmMax, 12)),
+    brokerHints: typeof o.brokerHints === "string" ? o.brokerHints : "",
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
       : process.env.SKILL_ENFORCER_DEBUG || undefined,
@@ -188,6 +197,15 @@ function referenceOf(skill: { id: string; name?: string; description?: string })
     trigger: words(`${skill.id} ${skill.name ?? ""} ${triggerText}`),
     body: words(bodyText),
   }
+}
+
+/** Сколько весит совпадение слов запроса со скиллом: триггер 2, описание 1. */
+function overlap(prompt: string, skill: SkillRef): number {
+  const promptWords = words(prompt)
+  let score = 0
+  for (const w of skill.trigger) if (promptWords.has(w)) score += 2
+  for (const w of skill.body) if (promptWords.has(w)) score += 1
+  return score
 }
 
 function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore: number): string[] {
@@ -454,18 +472,18 @@ async function llmBroker(input: {
   needSkills: number
   docs: BrokerDocCandidate[]
   needDocs: number
+  hints?: string
   generate: (text: string) => Promise<string>
   log?: (message: string) => void
 }): Promise<BrokerResult> {
   const lines = [
-    "Ты подбираешь материалы под задачу. Выбирай только то, что реально поможет ответить,",
-    "не выбирай по названию инструмента. Если подходящего нет — пиши NONE.",
-    "Скиллы про сам инструмент (opencode, report, mcp-setup, pi-setup) бери только если",
-    "задача прямо про этот инструмент; для правки и ревью кода есть code-comments.",
-    "",
-    `Запрос: ${input.prompt}`,
-    "",
+    "Ты подбираешь материалы под задачу. Выбирай только то, что реально поможет ответить.",
+    "Не выбирай по названию инструмента: скилл про сам инструмент нужен, только когда",
+    "задача прямо про этот инструмент. Если подходящего нет — пиши NONE.",
   ]
+  // Указания под свой набор скиллов — из конфига, а не в коде плагина.
+  if (input.hints) lines.push(input.hints)
+  lines.push("", `Запрос: ${input.prompt}`, "")
   if (input.needSkills > 0 && input.skills.length > 0) {
     lines.push(`СКИЛЛЫ (выбери до ${input.needSkills}, или NONE):`)
     for (const s of input.skills) lines.push(`- ${s.id}: ${s.description.slice(0, 160)}`)
@@ -679,7 +697,12 @@ export default Plugin.define({
           options.skillLlm && taskAttached.length < options.minSkills
             ? options.minSkills - taskAttached.length
             : 0
-        const skillCandidates = all.filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
+        const skillCandidates = options.skillLlm
+          ? all
+              .filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
+              .filter((s) => overlap(text, s) > 0)
+              .slice(0, options.skillLlmMax)
+          : []
         const docNeeding = options.docLlm ? plans.filter((p) => p.picks.length === 0) : []
         const docCandidates: BrokerDocCandidate[] = []
         if (docNeeding.length > 0) {
@@ -711,6 +734,7 @@ export default Plugin.define({
               needSkills,
               docs: docCandidates,
               needDocs,
+              hints: options.brokerHints,
               generate: (t) => askModel(t, sessionID),
               log: note,
             })
