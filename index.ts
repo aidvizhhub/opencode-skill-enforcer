@@ -460,6 +460,8 @@ async function llmBroker(input: {
   const lines = [
     "Ты подбираешь материалы под задачу. Выбирай только то, что реально поможет ответить,",
     "не выбирай по названию инструмента. Если подходящего нет — пиши NONE.",
+    "Скиллы про сам инструмент (opencode, report, mcp-setup, pi-setup) бери только если",
+    "задача прямо про этот инструмент; для правки и ревью кода есть code-comments.",
     "",
     `Запрос: ${input.prompt}`,
     "",
@@ -701,6 +703,7 @@ export default Plugin.define({
         }
         const needDocs = docNeeding.reduce((n, p) => n + p.limit, 0)
         if ((needSkills > 0 && skillCandidates.length > 0) || (needDocs > 0 && docCandidates.length > 0)) {
+          const started = Date.now()
           try {
             const broker = await llmBroker({
               prompt: text,
@@ -722,7 +725,7 @@ export default Plugin.define({
               if (!plan) continue
               plan.picks.push(...picksFromHits(plan.units, [{ index: pick.unit, score: 1 }], plan.limit, options.docWindow))
             }
-            note(`broker: skills [${broker.skills.join(", ") || "—"}] docs [${broker.docs.map((d) => `D${d.doc}.${d.unit}`).join(", ") || "—"}]`)
+            note(`broker: skills [${broker.skills.join(", ") || "—"}] docs [${broker.docs.map((d) => `D${d.doc}.${d.unit}`).join(", ") || "—"}] ${Date.now() - started}ms`)
           } catch (error) {
             note(`broker failed: ${String(error)}`)
           }
