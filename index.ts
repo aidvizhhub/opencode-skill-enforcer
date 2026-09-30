@@ -652,6 +652,11 @@ export default Plugin.define({
           }
         }
 
+        const touched = new Set(contact)
+        for (const id of attach) touched.add(id)
+        const untouched = [...available].filter((id) => !touched.has(id))
+        note(`coverage: ${touched.size}/${available.size} скиллов; не трогали: ${untouched.join(", ") || "—"}`)
+
         if (attach.length === 0) return
 
         event.prompt.skills = [...current, ...attach.map((id) => ({ id }) as never)]
