@@ -239,20 +239,43 @@ function splitDoc(text: string): DocUnit[] {
   const units: DocUnit[] = []
   let start = -1
   let buf: string[] = []
+  let fence = false
+  let heading: string | undefined
+
   const flush = (end: number) => {
     if (start < 0) return
     const chunk = buf.join("\n").trim()
     const from = start
     start = -1
     buf = []
-    if (chunk) units.push({ start: from, end, title: labelOf(chunk), text: chunk, words: stemWords(chunk) })
+    if (!chunk) return
+    const title = labelOf(chunk) ?? heading ?? chunk.split("\n")[0].trim().slice(0, 80)
+    units.push({ start: from, end, title, text: chunk, words: stemWords(chunk) })
   }
+
+  const nextMeaningful = (i: number): string | undefined => {
+    for (let j = i + 1; j < lines.length; j++) if (lines[j].trim() !== "") return lines[j]
+    return undefined
+  }
+  const lastBuffered = (): string => {
+    for (let j = buf.length - 1; j >= 0; j--) if (buf[j].trim() !== "") return buf[j]
+    return ""
+  }
+
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === "") flush(i)
-    else {
-      if (start < 0) start = i
-      buf.push(lines[i])
+    const line = lines[i]
+    if (/^\s*(```|~~~)/.test(line)) fence = !fence
+    if (line.trim() === "" && !fence) {
+      // список из пунктов, разделённых пустой строкой, — один кусок, не рвём
+      const next = nextMeaningful(i)
+      if (LIST_ITEM.test(lastBuffered()) && next !== undefined && LIST_ITEM.test(next)) continue
+      flush(i)
+      continue
     }
+    const m = !fence ? line.trim().match(HEADING) : null
+    if (m) heading = m[2].trim()
+    if (start < 0) start = i
+    buf.push(line)
   }
   flush(lines.length)
 
@@ -264,7 +287,7 @@ function splitDoc(text: string): DocUnit[] {
       next.start = unit.start
       next.text = `${unit.text}\n${next.text}`
       next.words = stemWords(next.text)
-      next.title = labelOf(next.text)
+      next.title = labelOf(next.text) ?? next.title
       continue
     }
     merged.push(unit)
@@ -276,15 +299,17 @@ function isHeadingOnly(text: string): boolean {
   return text.split("\n").every((line) => HEADING.test(line.trim()))
 }
 
-/** Подпись куска: последний заголовок внутри, иначе первая строка. */
-function labelOf(text: string): string {
+/** Подпись куска: заголовок внутри, иначе последний виденный заголовок, иначе первая строка. */
+function labelOf(text: string): string | undefined {
   let heading: string | undefined
   for (const line of text.split("\n")) {
     const m = line.trim().match(HEADING)
     if (m) heading = m[2].trim()
   }
-  return (heading ?? text.split("\n")[0].trim()).slice(0, 80)
+  return heading
 }
+
+const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s/
 
 /** Обрезка по границе абзаца возле предела, чтобы не рвать фразу на полуслове. */
 function clipBlock(text: string, limit: number): string {
@@ -562,7 +587,9 @@ export default Plugin.define({
           if (chunks.length > 0) {
             const labels = options.documents.map((d) => d.path).join(", ")
             event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
-            note(`doc-inject: ${chunks.length} section(s), ${chunks.reduce((n, c) => n + c.length, 0)} chars (session ${sessionID})`)
+            const total = chunks.reduce((n, c) => n + c.length, 0)
+            const titles = chunks.map((c) => c.split("\n")[0].slice(0, 70))
+            note(`doc-inject: ${chunks.length} section(s), ${total} chars [${titles.join(" | ")}] (session ${sessionID})`)
           }
         }
 
