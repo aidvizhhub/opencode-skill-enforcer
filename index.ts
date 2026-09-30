@@ -36,9 +36,16 @@ interface Options {
   defaultSkills: string[]
   minPromptChars: number
   minScore: number
+  /** Скиллы «человеческого общения», которые держим в контакте всегда (цепляем один раз за сессию). */
+  alwaysSkills: string[]
+  /** Потолок на всё, что плагин цепляет к одному промпту (база + добор). */
+  maxAttach: number
   announce: boolean
   logFile?: string
 }
+
+/** База общения: структура ответа, живой контакт, язык без нейрослопа. */
+const DEFAULT_ALWAYS = ["result-first", "dialog-humanity", "anti-ai-sludge"]
 
 function readOptions(raw: unknown): Options {
   const o = (raw ?? {}) as Record<string, unknown>
@@ -55,6 +62,8 @@ function readOptions(raw: unknown): Options {
     defaultSkills: list(o.defaultSkills, []),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
     minScore: Math.max(1, int(o.minScore, 3)),
+    alwaysSkills: list(o.alwaysSkills, DEFAULT_ALWAYS),
+    maxAttach: Math.max(0, int(o.maxAttach, 6)),
     announce: bool(o.announce, false),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
@@ -119,16 +128,18 @@ function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore:
   return scored.slice(0, limit).map((s) => s.id)
 }
 
-function renderRule(min: number, max: number, loaded: string[]): string {
-  const loadedLine =
-    loaded.length === 0
-      ? "Пока ничего не загружено в этом ходе — загрузи первым делом, прежде чем отвечать по существу."
-      : `Уже в контакте: ${loaded.join(", ")}. Следуй им и не перезагружай без нужды; сменилась задача — добери по теме.`
+function renderRule(min: number, max: number, taskLoaded: number, taskInContact: string[], base: string[]): string {
+  const baseLine = base.length > 0
+    ? `Базовые скиллы общения держим в контакте всегда: ${base.join(", ")}. Не отвечай вопреки им.`
+    : "Базовых скиллов общения не задано."
+  const contactLine = taskInContact.length === 0
+    ? "Рабочих скиллов в контакте пока нет — загрузи первым делом, прежде чем отвечать по существу."
+    : `Уже в контакте по задаче: ${taskInContact.join(", ")}. Следуй им и не перезагружай без нужды; сменилась задача — добери по теме.`
   return [
     "ПРАВИЛО СКИЛЛОВ (проверка на каждом шаге):",
-    `1. Перед содержательным ответом сверься с доступными скиллами и загрузи через инструмент skill минимум ${min} подходящих (цель ${min}–${max}).`,
-    "2. Не отвечай по существу, не загрузив ни одного скилла, если задача вообще подпадает под наши скиллы.",
-    `3. ${loadedLine}`,
+    `1. ${baseLine}`,
+    `2. Перед содержательным ответом сверься со списком скиллов и загрузи через инструмент skill минимум ${min} подходящих по задаче (цель ${min}–${max}). Сейчас по задаче в контакте: ${taskLoaded}/${min}.`,
+    `3. ${contactLine}`,
   ].join("\n")
 }
 
@@ -136,8 +147,10 @@ export default Plugin.define({
   id: "skill-enforcer",
   setup(ctx) {
     const options = readOptions(ctx.options)
-    // sessionID -> ID скиллов, загруженных с начала текущего хода
-    const loadedThisTurn = new Map<string, Set<string>>()
+    /** sessionID -> всё, что уже в контексте (база + рабочие, прицепленные или загруженные инструментом). */
+    const inContact = new Map<string, Set<string>>()
+    /** sessionID -> рабочие скиллы, попавшие в контекст в текущем ходе (для счётчика «минимум N»). */
+    const turnTask = new Map<string, Set<string>>()
 
     const note = (message: string) => {
       const line = `${new Date().toISOString()} ${TAG} ${message}\n`
@@ -167,32 +180,52 @@ export default Plugin.define({
       try {
         const sessionID = event.sessionID
         const current = event.prompt.skills ?? []
-        // в «контакте» с начала хода считаем и пред-выбранные скиллы, и то, что доцеп им сами
-        const inContact = new Set(current.map((s) => String(s.id)))
-        loadedThisTurn.set(sessionID, inContact)
+        const contact = inContact.get(sessionID) ?? new Set<string>()
+        for (const s of current) contact.add(String(s.id))
+        inContact.set(sessionID, contact)
+        turnTask.set(sessionID, new Set())
 
         if (!options.autoAttach) return
         const text = event.prompt.text ?? ""
         if (text.trim().length < options.minPromptChars) return
 
-        const refs = await skillsAtHand()
-        if (refs.length === 0) return
+        const all = await skillsAtHand()
+        if (all.length === 0) return
+        const available = new Set(all.map((s) => s.id))
+        const atCap = () => options.maxAttach > 0 && attach.length >= options.maxAttach
+        const attach: string[] = []
+        const taskAttached: string[] = []
 
-        const picked = pickSkills(text, refs, options.maxSkills, options.minScore)
-        if (options.padToMin && picked.length < options.minSkills) {
+        // база общения — обязательна, цепляем один раз за сессию
+        for (const id of options.alwaysSkills) {
+          if (atCap()) break
+          if (!available.has(id) || contact.has(id) || attach.includes(id)) continue
+          attach.push(id)
+        }
+
+        // добор по смыслу текущего запроса
+        const matched = pickSkills(text, all, options.maxSkills, options.minScore)
+        if (options.padToMin && matched.length < options.minSkills) {
           for (const id of options.defaultSkills) {
-            if (picked.length >= options.minSkills) break
-            if (!picked.includes(id)) picked.push(id)
+            if (matched.length >= options.minSkills) break
+            if (!matched.includes(id)) matched.push(id)
           }
         }
-        if (picked.length === 0) return
+        for (const id of matched) {
+          if (atCap()) break
+          if (contact.has(id) || attach.includes(id)) continue
+          attach.push(id)
+          taskAttached.push(id)
+        }
 
-        const added = picked.filter((id) => !inContact.has(id))
-        if (added.length === 0) return
+        if (attach.length === 0) return
 
-        event.prompt.skills = [...current, ...added.map((id) => ({ id }) as never)]
-        for (const id of added) inContact.add(id)
-        note(`attached: ${added.join(", ")} (session ${sessionID})`)
+        event.prompt.skills = [...current, ...attach.map((id) => ({ id }) as never)]
+        for (const id of attach) contact.add(id)
+        const turnSet = turnTask.get(sessionID) ?? new Set<string>()
+        for (const id of taskAttached) turnSet.add(id)
+        turnTask.set(sessionID, turnSet)
+        note(`attached: ${attach.join(", ")} (session ${sessionID})`)
       } catch (error) {
         note(`prompt hook failed: ${String(error)}`)
       }
@@ -200,16 +233,19 @@ export default Plugin.define({
 
     ctx.session.hook("context", (event) => {
       try {
-        const loaded = [...(loadedThisTurn.get(event.sessionID) ?? [])]
-        const rule = renderRule(options.minSkills, options.maxSkills, loaded)
+        const contact = inContact.get(event.sessionID) ?? new Set<string>()
+        const base = options.alwaysSkills.filter((id) => contact.has(id))
+        const task = [...contact].filter((id) => !base.includes(id))
+        const loaded = turnTask.get(event.sessionID)?.size ?? 0
+        const rule = renderRule(options.minSkills, options.maxSkills, loaded, task, base)
         event.system.push({ type: "text", text: rule } as never)
-        note(`injected rule: session=${event.sessionID} loaded=${loaded.length}`)
+        note(`injected rule: session=${event.sessionID} base=${base.length} task=${task.length}`)
       } catch (error) {
         note(`context hook failed: ${String(error)}`)
       }
     })
 
-    note(`loaded: min=${options.minSkills} max=${options.maxSkills} autoAttach=${options.autoAttach}`)
+    note(`loaded: min=${options.minSkills} max=${options.maxSkills} always=${options.alwaysSkills.join(",") || "-"} autoAttach=${options.autoAttach}`)
 
     ctx.tool.hook("execute.before", (event) => {
       try {
@@ -217,10 +253,13 @@ export default Plugin.define({
         const input = event.input as { id?: unknown } | undefined
         const id = typeof input?.id === "string" ? input.id : undefined
         if (!id) return
-        const set = loadedThisTurn.get(event.sessionID) ?? new Set<string>()
-        set.add(id)
-        loadedThisTurn.set(event.sessionID, set)
-        note(`loaded: ${id} (session ${event.sessionID}, turn total ${set.size})`)
+        const turnSet = turnTask.get(event.sessionID) ?? new Set<string>()
+        turnSet.add(id)
+        turnTask.set(event.sessionID, turnSet)
+        const contact = inContact.get(event.sessionID) ?? new Set<string>()
+        contact.add(id)
+        inContact.set(event.sessionID, contact)
+        note(`loaded: ${id} (session ${event.sessionID}, turn total ${turnSet.size})`)
       } catch (error) {
         note(`tool hook failed: ${String(error)}`)
       }
