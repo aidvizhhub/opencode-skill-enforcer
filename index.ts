@@ -355,6 +355,13 @@ function labelOf(text: string): string | undefined {
   return heading
 }
 
+/** Короткий хэш текста: меняется — значит кусок в контексте устарел. */
+function contentHash(text: string): string {
+  let h = 5381
+  for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0
+  return h.toString(36)
+}
+
 const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s/
 
 /** Обрезка по границе абзаца возле предела, чтобы не рвать фразу на полуслове. */
@@ -644,11 +651,11 @@ export default Plugin.define({
         let used = 0
         let added = 0
         for (const block of picks) {
-          const key = `${path}#${block.start}`
+          const key = `${path}#${block.start}#${contentHash(block.text)}`
           if (used >= budget) continue
-          const header = `[${label} — «${block.title}»]`
+          const header = `[${label} — «${block.title}» #${contentHash(block.text)}]`
           if (history !== null) {
-            // кусок уже в контексте сессии — не дублируем; выпал (сжатие) — подставим снова
+            // кусок уже в контексте сессии — не дублируем; выпал (сжатие) или изменён — подставим
             if (history.includes(header)) continue
           } else if (seen.has(key)) {
             continue
