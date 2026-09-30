@@ -437,70 +437,78 @@ function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limi
  * Нужен там, где словесный поиск промахнулся (синонимы, другой корень).
  * Список кандидатов режем по `maxCandidates`, чтобы не раздувать запрос.
  */
-async function llmSelect(
-  prompt: string,
-  units: DocUnit[],
-  generate: (text: string) => Promise<string>,
-  limit: number,
-  window: number,
-  maxCandidates: number,
-  log?: (message: string) => void,
-): Promise<DocPick[]> {
-  const preview = (unit: DocUnit) => unit.text.split("\n").slice(0, 3).join(" ").slice(0, 200)
-  let candidates = units.map((unit, index) => ({ unit, index }))
-  if (candidates.length > maxCandidates) {
-    const promptWords = new Set([...stemWords(prompt), ...words(prompt)])
-    const overlap = candidates.filter((c) => [...c.unit.words].some((w) => promptWords.has(w)))
-    const rest = candidates.filter((c) => !overlap.includes(c))
-    candidates = [...overlap, ...rest].slice(0, maxCandidates)
-  }
-  const listing = candidates.map((c, i) => `${i}: ${preview(c.unit)}`).join("\n")
-  const ask = [
-    "Ниже пронумерованные абзацы из файла-справочника и запрос пользователя.",
-    "Выбери номера абзацев, которые реально нужны для ответа на запрос.",
-    `Ответь только номерами через запятую (не больше ${limit}), или NONE.`,
-    "",
-    `Запрос: ${prompt}`,
-    "",
-    listing,
-  ].join("\n")
-  const answer = await generate(ask)
-  log?.(`raw: ${answer.replace(/\s+/g, " ").slice(0, 160)}`)
-  const indices = (answer.match(/\d+/g) ?? []).map(Number).filter((n) => n >= 0 && n < candidates.length)
-  if (indices.length === 0) return []
-  const hits = indices.slice(0, limit).map((n, order) => ({ index: candidates[n].index, score: 1 - order / 100 }))
-  return picksFromHits(units, hits, limit, window)
+/** Короткое превью абзаца для показа модели. */
+function unitPreview(unit: DocUnit): string {
+  return unit.text.split("\n").slice(0, 3).join(" ").slice(0, 200)
+}
+
+interface BrokerDocCandidate {
+  doc: number
+  unit: number
+  preview: string
+}
+
+interface BrokerResult {
+  skills: string[]
+  docs: { doc: number; unit: number }[]
 }
 
 /**
- * Семантический пик скиллов: когда словесный добор недобрал, спрашиваем модель по
- * списку «id — описание». Возвращает ID из списка, максимум `need`.
+ * Один вызов модели на оба источника: выбирает и скиллы, и абзацы справочников.
+ * Ответ ждём двумя строками: `SKILLS: ...` и `DOCS: D<док>.<абзац>, ...`.
  */
-async function llmPickSkills(
-  prompt: string,
-  refs: SkillRef[],
-  generate: (text: string) => Promise<string>,
-  need: number,
-  log?: (message: string) => void,
-): Promise<string[]> {
-  if (refs.length === 0 || need <= 0) return []
-  const listing = refs.map((r) => `- ${r.id}: ${r.description.slice(0, 160)}`).join("\n")
-  const ask = [
-    "Ты подбираешь скиллы-инструкции под задачу пользователя.",
-    "Выбирай только те, что реально помогут ответить. Не выбирай скилл по названию инструмента.",
-    `Ответь не больше чем ${need} ID через запятую, ровно из списка ниже. Если подходящих нет — ответь NONE.`,
+async function llmBroker(input: {
+  prompt: string
+  skills: SkillRef[]
+  needSkills: number
+  docs: BrokerDocCandidate[]
+  needDocs: number
+  generate: (text: string) => Promise<string>
+  log?: (message: string) => void
+}): Promise<BrokerResult> {
+  const lines = [
+    "Ты подбираешь материалы под задачу. Выбирай только то, что реально поможет ответить,",
+    "не выбирай по названию инструмента. Если подходящего нет — пиши NONE.",
     "",
-    `Запрос: ${prompt}`,
+    `Запрос: ${input.prompt}`,
     "",
-    "Скиллы:",
-    listing,
-  ].join("\n")
-  const answer = await generate(ask)
-  log?.(`skill llm raw: ${answer.replace(/\s+/g, " ").slice(0, 160)}`)
-  return refs
-    .map((r) => r.id)
-    .filter((id) => new RegExp(`(^|[^\\w-])${id}([^\\w-]|$)`).test(answer))
-    .slice(0, need)
+  ]
+  if (input.needSkills > 0 && input.skills.length > 0) {
+    lines.push(`СКИЛЛЫ (выбери до ${input.needSkills}, или NONE):`)
+    for (const s of input.skills) lines.push(`- ${s.id}: ${s.description.slice(0, 160)}`)
+    lines.push("")
+  }
+  if (input.needDocs > 0 && input.docs.length > 0) {
+    lines.push(`АБЗАЦЫ (выбери до ${input.needDocs}, формат D<документ>.<абзац>, или NONE):`)
+    for (const c of input.docs) lines.push(`[D${c.doc}.${c.unit}] ${c.preview}`)
+    lines.push("")
+  }
+  lines.push("Ответ строго двумя строками, без пояснений:")
+  lines.push("SKILLS: <id, id | NONE>")
+  lines.push("DOCS: <D0.3, D1.7 | NONE>")
+
+  const answer = await input.generate(lines.join("\n"))
+  input.log?.(`broker raw: ${answer.replace(/\s+/g, " ").slice(0, 200)}`)
+
+  const skillsLine = answer.match(/SKILLS:\s*([^\n]*)/i)?.[1] ?? ""
+  const docsLine = answer.match(/DOCS:\s*([^\n]*)/i)?.[1] ?? ""
+
+  const skills = input.skills
+    .map((s) => s.id)
+    .filter((id) => new RegExp(`(^|[^\\w-])${id}([^\\w-]|$)`).test(skillsLine))
+    .slice(0, Math.max(0, input.needSkills))
+
+  const docs: { doc: number; unit: number }[] = []
+  if (input.needDocs > 0) {
+    for (const m of docsLine.matchAll(/D(\d+)\.(\d+)/gi)) {
+      const doc = Number(m[1])
+      const unit = Number(m[2])
+      if (docs.some((d) => d.doc === doc && d.unit === unit)) continue
+      docs.push({ doc, unit })
+      if (docs.length >= input.needDocs) break
+    }
+  }
+  return { skills, docs }
 }
 
 function renderRule(
@@ -619,59 +627,30 @@ export default Plugin.define({
       }
     }
 
-    const docsFor = async (prompt: string, sessionID: string, history: string | null): Promise<string[]> => {
-      const seen = await loadSeen(sessionID)
-      const chunks: string[] = []
-      let dirty = false
-      for (const spec of options.documents) {
-        const path = expandHome(spec.path)
-        let cached = docCache.get(path)
-        try {
-          const mtimeMs = statSync(path).mtimeMs
-          if (!cached || cached.mtimeMs !== mtimeMs) {
-            cached = { mtimeMs, units: splitDoc(readFileSync(path, "utf8")) }
-            docCache.set(path, cached)
-          }
-        } catch (error) {
-          note(`doc read failed ${path}: ${String(error)}`)
-          continue
+    /** Читает файл-справочник (кэш по mtime) и режет на блоки. */
+    const docUnitsFor = (spec: DocSpec): { path: string; label: string; units: DocUnit[] } | null => {
+      const path = expandHome(spec.path)
+      let cached = docCache.get(path)
+      try {
+        const mtimeMs = statSync(path).mtimeMs
+        if (!cached || cached.mtimeMs !== mtimeMs) {
+          cached = { mtimeMs, units: splitDoc(readFileSync(path, "utf8")) }
+          docCache.set(path, cached)
         }
-        const limit = spec.maxBlocks ?? options.maxDocBlocks
-        const budget = spec.maxChars ?? options.maxDocChars
-        const label = spec.title ?? spec.path
-        let picks = selectBlocks(prompt, cached.units, options.minDocScore, limit, options.docWindow)
-        if (picks.length === 0 && options.docLlm) {
-          try {
-            picks = await llmSelect(prompt, cached.units, (t) => askModel(t, sessionID), limit, options.docWindow, options.docLlmMax, note)
-            note(`doc llm: picked ${picks.length} (${path}) ${picks.map((p) => p.title).join(" | ")}`)
-          } catch (error) {
-            note(`doc llm failed ${path}: ${String(error)}`)
-          }
-        }
-        let used = 0
-        let added = 0
-        for (const block of picks) {
-          const key = `${path}#${block.start}#${contentHash(block.text)}`
-          if (used >= budget) continue
-          const header = `[${label} — «${block.title}» #${contentHash(block.text)}]`
-          if (history !== null) {
-            // кусок уже в контексте сессии — не дублируем; выпал (сжатие) или изменён — подставим
-            if (history.includes(header)) continue
-          } else if (seen.has(key)) {
-            continue
-          }
-          const piece = clipBlock(block.text, budget - used)
-          if (piece.length === 0) continue
-          chunks.push(`${header}\n${piece}`)
-          seen.add(key)
-          dirty = true
-          used += piece.length
-          added += 1
-        }
-        note(`doc ${path}: ${cached.units.length} units, added ${added}, ${used} chars`)
+      } catch (error) {
+        note(`doc read failed ${path}: ${String(error)}`)
+        return null
       }
-      if (dirty) await saveSeen(sessionID, seen)
-      return chunks
+      return { path, label: spec.title ?? spec.path, units: cached.units }
+    }
+
+    interface DocPlan {
+      path: string
+      label: string
+      units: DocUnit[]
+      picks: DocPick[]
+      limit: number
+      budget: number
     }
 
     ctx.session.hook("prompt", async (event) => {
@@ -684,36 +663,36 @@ export default Plugin.define({
         turnTask.set(sessionID, new Set())
 
         const text = event.prompt.text ?? ""
-        const substantive = text.trim().length >= options.minPromptChars
-        const history = substantive ? await recentHistory(sessionID) : null
+        if (text.trim().length < options.minPromptChars) return
+        const history = await recentHistory(sessionID)
         // скилл уже в контексте сессии? Проверяем по истории (после сжатия вернём заново)
         const skillInContext = (id: string) =>
           history !== null ? new RegExp(`/skills/${id}(\\b|/)`).test(history) : contact.has(id)
 
-        // справочники: релевантный раздел уезжает в контекст целиком; включается списком documents
-        if (substantive && options.documents.length > 0) {
-          const chunks = await docsFor(text, sessionID, history)
-          if (chunks.length > 0) {
-            const labels = options.documents.map((d) => d.path).join(", ")
-            event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
-            const total = chunks.reduce((n, c) => n + c.length, 0)
-            const titles = chunks.map((c) => c.split("\n")[0].slice(0, 70))
-            note(`doc-inject: ${chunks.length} section(s), ${total} chars [${titles.join(" | ")}] (session ${sessionID})`)
-          }
+        // справочники: читаем файлы и делаем словесный отбор
+        const plans: DocPlan[] = []
+        for (const spec of options.documents) {
+          const got = docUnitsFor(spec)
+          if (!got) continue
+          const limit = spec.maxBlocks ?? options.maxDocBlocks
+          plans.push({
+            path: got.path,
+            label: got.label,
+            units: got.units,
+            limit,
+            budget: spec.maxChars ?? options.maxDocChars,
+            picks: selectBlocks(text, got.units, options.minDocScore, limit, options.docWindow),
+          })
         }
 
-        if (!options.autoAttach) return
-        if (!options.attachAlways && !options.attachPicked && !options.skillLlm) return
-        if (!substantive) return
-
-        const all = await skillsAtHand()
-        if (all.length === 0) return
+        // скиллы: база и словесный добор
+        const wantSkills = options.autoAttach && (options.attachAlways || options.attachPicked || options.skillLlm)
+        const all = wantSkills ? await skillsAtHand() : []
         const available = new Set(all.map((s) => s.id))
-        const atCap = () => options.maxAttach > 0 && attach.length >= options.maxAttach
         const attach: string[] = []
         const taskAttached: string[] = []
+        const atCap = () => options.maxAttach > 0 && attach.length >= options.maxAttach
 
-        // база общения — обязательна, цепляем один раз за сессию
         if (options.attachAlways) {
           for (const id of options.alwaysSkills) {
             if (atCap()) break
@@ -721,8 +700,6 @@ export default Plugin.define({
             attach.push(id)
           }
         }
-
-        // добор по смыслу текущего запроса
         if (options.attachPicked) {
           const matched = pickSkills(text, all, options.maxSkills, options.minScore)
           if (options.padToMin && matched.length < options.minSkills) {
@@ -739,23 +716,102 @@ export default Plugin.define({
           }
         }
 
-        // гарантия: если рабочих скиллов меньше minSkills — спрашиваем модель и подкладываем
-        if (options.skillLlm && taskAttached.length < options.minSkills) {
+        // один вызов модели на оба источника, когда хоть где-то недобор
+        const needSkills =
+          options.skillLlm && taskAttached.length < options.minSkills
+            ? options.minSkills - taskAttached.length
+            : 0
+        const skillCandidates = all.filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
+        const docNeeding = options.docLlm ? plans.filter((p) => p.picks.length === 0) : []
+        const docCandidates: BrokerDocCandidate[] = []
+        if (docNeeding.length > 0) {
+          const promptWords = new Set([...stemWords(text), ...words(text)])
+          const rank = (unit: DocUnit) => {
+            let n = 0
+            for (const w of unit.words) if (promptWords.has(w)) n++
+            return n
+          }
+          let free = options.docLlmMax
+          for (let di = 0; di < plans.length && free > 0; di++) {
+            const plan = plans[di]
+            if (!docNeeding.includes(plan)) continue
+            const order = plan.units.map((u, i) => ({ u, i })).sort((a, b) => rank(b.u) - rank(a.u))
+            for (const { u, i } of order) {
+              if (free <= 0) break
+              docCandidates.push({ doc: di, unit: i, preview: unitPreview(u) })
+              free--
+            }
+          }
+        }
+        const needDocs = docNeeding.reduce((n, p) => n + p.limit, 0)
+        if ((needSkills > 0 && skillCandidates.length > 0) || (needDocs > 0 && docCandidates.length > 0)) {
           try {
-            const need = options.minSkills - taskAttached.length
-            const candidates = all.filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
-            const picked = await llmPickSkills(text, candidates, (t) => askModel(t, sessionID), need, note)
-            for (const id of picked) {
+            const broker = await llmBroker({
+              prompt: text,
+              skills: skillCandidates,
+              needSkills,
+              docs: docCandidates,
+              needDocs,
+              generate: (t) => askModel(t, sessionID),
+              log: note,
+            })
+            for (const id of broker.skills) {
               if (atCap()) break
-              if (contact.has(id) || attach.includes(id)) continue
+              if (!available.has(id) || skillInContext(id) || attach.includes(id)) continue
               attach.push(id)
               taskAttached.push(id)
             }
-            note(`skill llm: picked ${picked.join(", ") || "—"} (session ${sessionID})`)
+            for (const pick of broker.docs) {
+              const plan = plans[pick.doc]
+              if (!plan) continue
+              plan.picks.push(...picksFromHits(plan.units, [{ index: pick.unit, score: 1 }], plan.limit, options.docWindow))
+            }
+            note(`broker: skills [${broker.skills.join(", ") || "—"}] docs [${broker.docs.map((d) => `D${d.doc}.${d.unit}`).join(", ") || "—"}]`)
           } catch (error) {
-            note(`skill llm failed: ${String(error)}`)
+            note(`broker failed: ${String(error)}`)
           }
         }
+
+        // вставка кусков справочников
+        if (plans.length > 0) {
+          const seen = await loadSeen(sessionID)
+          const chunks: string[] = []
+          let dirty = false
+          for (const plan of plans) {
+            let used = 0
+            let added = 0
+            for (const block of plan.picks) {
+              const hash = contentHash(block.text)
+              const key = `${plan.path}#${block.start}#${hash}`
+              if (used >= plan.budget) continue
+              const header = `[${plan.label} — «${block.title}» #${hash}]`
+              if (history !== null) {
+                // кусок уже в контексте сессии — не дублируем; выпал или изменён — подставим
+                if (history.includes(header)) continue
+              } else if (seen.has(key)) {
+                continue
+              }
+              const piece = clipBlock(block.text, plan.budget - used)
+              if (piece.length === 0) continue
+              chunks.push(`${header}\n${piece}`)
+              seen.add(key)
+              dirty = true
+              used += piece.length
+              added += 1
+            }
+            note(`doc ${plan.path}: ${plan.units.length} units, added ${added}, ${used} chars`)
+          }
+          if (dirty) await saveSeen(sessionID, seen)
+          if (chunks.length > 0) {
+            const labels = options.documents.map((d) => d.path).join(", ")
+            event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
+            const total = chunks.reduce((n, c) => n + c.length, 0)
+            const titles = chunks.map((c) => c.split("\n")[0].slice(0, 70))
+            note(`doc-inject: ${chunks.length} section(s), ${total} chars [${titles.join(" | ")}] (session ${sessionID})`)
+          }
+        }
+
+        if (!wantSkills || all.length === 0) return
 
         // покрытие считаем по факту: что лежит в контексте сессии плюс что цепляем сейчас
         const touched = new Set<string>()
