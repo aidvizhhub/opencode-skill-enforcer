@@ -521,8 +521,23 @@ export default Plugin.define({
      * Подбирает по промпту разделы из файлов-справочников. Возвращает готовые куски
      * для вставки в сообщение; один и тот же раздел в сессии не повторяем.
      */
+    /**
+     * Текст последних сообщений сессии — по нему видно, лежит ли кусок в контексте
+     * прямо сейчас (после сжатия истории он может выпасть, тогда подставим снова).
+     */
+    const recentHistory = async (sessionID: string): Promise<string | null> => {
+      try {
+        const messages = await ctx.session.context({ sessionID })
+        return JSON.stringify(messages.slice(-60))
+      } catch (error) {
+        note(`doc history failed: ${String(error)}`)
+        return null
+      }
+    }
+
     const docsFor = async (prompt: string, sessionID: string): Promise<string[]> => {
       const seen = await loadSeen(sessionID)
+      const history = options.documents.length > 0 ? await recentHistory(sessionID) : null
       const chunks: string[] = []
       let dirty = false
       for (const spec of options.documents) {
@@ -554,10 +569,17 @@ export default Plugin.define({
         let added = 0
         for (const block of picks) {
           const key = `${path}#${block.start}`
-          if (seen.has(key) || used >= budget) continue
+          if (used >= budget) continue
+          const header = `[${label} — «${block.title}»]`
+          if (history !== null) {
+            // кусок уже в контексте сессии — не дублируем; выпал (сжатие) — подставим снова
+            if (history.includes(header)) continue
+          } else if (seen.has(key)) {
+            continue
+          }
           const piece = clipBlock(block.text, budget - used)
           if (piece.length === 0) continue
-          chunks.push(`[${label} — «${block.title}»]\n${piece}`)
+          chunks.push(`${header}\n${piece}`)
           seen.add(key)
           dirty = true
           used += piece.length
