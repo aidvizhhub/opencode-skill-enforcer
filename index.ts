@@ -1,6 +1,6 @@
-import { appendFileSync, readFileSync, statSync } from "node:fs"
-import { homedir } from "node:os"
-import { join } from "node:path"
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
+import { dirname, join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 
 /**
@@ -37,6 +37,9 @@ import { Plugin } from "@opencode/plugin"
  *   skillLlmMax     — сколько скиллов показывать модели на выбор; берём только те, у кого
  *                     есть словесное совпадение с запросом (по умолчанию 12)
  *   brokerHints     — указания брокеру под свой набор скиллов (по умолчанию пусто)
+ *   cacheFile       — файл кэша выбора брокера; по умолчанию в системной папке /tmp
+ *                     (пустая строка — кэш выключен)
+ *   cacheHours      — сколько дней запись в кэше живёт (по умолчанию 3)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
 
@@ -71,6 +74,10 @@ interface Options {
   skillLlmMax: number
   /** Указания брокеру под свой набор скиллов: «правка кода — вот этот скилл». */
   brokerHints: string
+  /** Файл кэша выбора брокера; пусто — кэш выключен. */
+  cacheFile: string
+  /** Сколько дней запись в кэше живёт. */
+  cacheHours: number
   logFile?: string
 }
 
@@ -132,6 +139,11 @@ function readOptions(raw: unknown): Options {
     docLlmMax: Math.max(10, int(o.docLlmMax, 300)),
     skillLlmMax: Math.max(3, int(o.skillLlmMax, 12)),
     brokerHints: typeof o.brokerHints === "string" ? o.brokerHints : "",
+    cacheFile:
+      typeof o.cacheFile === "string" && o.cacheFile.length > 0
+        ? o.cacheFile
+        : join(tmpdir(), "opencode-skill-enforcer", "broker-cache.json"),
+    cacheHours: Math.max(1, int(o.cacheHours, 72)),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
       : process.env.SKILL_ENFORCER_DEBUG || undefined,
@@ -371,6 +383,72 @@ function contentHash(text: string): string {
   return h.toString(36)
 }
 
+interface CacheEntry {
+  skills: string[]
+  /** куски справочников по хэшу текста, а не по номеру: при правке файла номер сдвинется, хэш — нет. */
+  docs: string[]
+  at: number
+}
+
+/** Ключ — от текста запроса без регистра, пунктуации и хвоста: «объясни API» и «Объясни API!!» — одно и то же. */
+function cacheKey(prompt: string): string {
+  const norm = prompt
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return contentHash(norm.slice(0, 400))
+}
+
+/** Кэш выбора брокера. Файл читается один раз за сессию плагина, запись переписывает его целиком. */
+function makeCache(file: string, ttlHours: number, note: (m: string) => void) {
+  let entries: Map<string, CacheEntry> | null = null
+
+  const load = () => {
+    if (entries) return entries
+    entries = new Map()
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, CacheEntry>
+      for (const [key, value] of Object.entries(raw)) {
+        if (Array.isArray(value?.skills) && typeof value.at === "number") {
+          entries.set(key, { skills: value.skills, docs: Array.isArray(value.docs) ? value.docs : [], at: value.at })
+        }
+      }
+    } catch {
+      // файла нет или он битый — просто начинаем с пустого кэша
+    }
+    return entries
+  }
+
+  const ttl = ttlHours * 3600_000
+
+  return {
+    get(prompt: string): CacheEntry | null {
+      const entry = load().get(cacheKey(prompt))
+      if (!entry) return null
+      if (Date.now() - entry.at > ttl) {
+        load().delete(cacheKey(prompt))
+        return null
+      }
+      return entry
+    },
+    set(prompt: string, skills: string[], docs: string[]) {
+      const map = load()
+      const key = cacheKey(prompt)
+      map.set(key, { skills, docs, at: Date.now() })
+      const fresh: Record<string, CacheEntry> = {}
+      for (const [k, v] of map) if (Date.now() - v.at <= ttl) fresh[k] = v
+      try {
+        mkdirSync(dirname(file), { recursive: true })
+        writeFileSync(file, JSON.stringify(fresh))
+      } catch (error) {
+        note(`cache write failed: ${String(error)}`)
+      }
+    },
+    size: () => load().size,
+  }
+}
+
 const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s/
 
 /** Обрезка по границе абзаца возле предела, чтобы не рвать фразу на полуслове. */
@@ -573,6 +651,8 @@ export default Plugin.define({
       }
     }
 
+    const cache = makeCache(options.cacheFile, options.cacheHours, note)
+
     const skillsAtHand = async (): Promise<SkillRef[]> => {
       try {
         const all = (await ctx.skill.list()).data
@@ -693,7 +773,7 @@ export default Plugin.define({
         }
 
         // один вызов модели на оба источника, когда хоть где-то недобор
-        const needSkills =
+        let needSkills =
           options.skillLlm && taskAttached.length < options.minSkills
             ? options.minSkills - taskAttached.length
             : 0
@@ -725,7 +805,36 @@ export default Plugin.define({
           }
         }
         const needDocs = docNeeding.reduce((n, p) => n + p.limit, 0)
-        if ((needSkills > 0 && skillCandidates.length > 0) || (needDocs > 0 && docCandidates.length > 0)) {
+        // 1) кэш: повторяющийся запрос закрываем без вызова модели. Кусок справочника
+        // узнаём по хэшу текста — после правки файла он переехал, но хэш тот же.
+        let needModel = needDocs > 0 && docCandidates.length > 0
+        const cached = needSkills > 0 || needModel ? cache.get(text) : null
+        if (cached) {
+          if (needSkills > 0) {
+            for (const id of cached.skills) {
+              if (atCap()) break
+              if (!available.has(id) || skillInContext(id) || attach.includes(id)) continue
+              attach.push(id)
+              taskAttached.push(id)
+            }
+          }
+          for (const plan of docNeeding) {
+            const want = new Set(cached.docs)
+            const found = plan.units
+              .map((u, i) => ({ i, hash: contentHash(u.text) }))
+              .filter(({ hash }) => want.has(hash))
+              .map(({ i }) => i)
+            if (found.length > 0) {
+              plan.picks.push(...picksFromHits(plan.units, found.map((index) => ({ index, score: 1 })), plan.limit, options.docWindow))
+            }
+          }
+          note(`broker: cache hit [${cached.skills.join(", ") || "—"}] docs [${cached.docs.length}] (${cache.size()} записей)`)
+          needSkills = 0
+          needModel = docNeeding.some((p) => p.picks.length === 0)
+        } else if (needSkills > 0 && skillCandidates.length > 0) {
+          needModel = true
+        }
+        if (needModel) {
           const started = Date.now()
           try {
             const broker = await llmBroker({
@@ -738,6 +847,13 @@ export default Plugin.define({
               generate: (t) => askModel(t, sessionID),
               log: note,
             })
+            // пустой ответ не затирает прошлый удачный: иначе ход, где нужны были только
+            // куски справочников, обнулил бы запись по скиллам
+            const pickedDocs = broker.docs
+              .map((pick) => plans[pick.doc]?.units[pick.unit])
+              .filter(Boolean)
+              .map((u) => contentHash(u!.text))
+            if (broker.skills.length > 0 || pickedDocs.length > 0) cache.set(text, broker.skills, pickedDocs)
             for (const id of broker.skills) {
               if (atCap()) break
               if (!available.has(id) || skillInContext(id) || attach.includes(id)) continue
