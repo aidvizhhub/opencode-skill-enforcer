@@ -33,6 +33,8 @@ import { Plugin } from "@opencode/plugin"
  *   maxDocBlocks    — сколько попаданий из одного файла максимум (по умолчанию 2)
  *   docWindow       — на сколько соседних абзацев раздувать попадание (по умолчанию 1)
  *   maxDocChars     — потолок символов из одного файла за ход (по умолчанию 8000)
+ *   docLlm          — семантический добор: если словесный поиск пуст, спросить модель (по умолчанию false)
+ *   docLlmMax       — сколько абзацев показывать модели на выбор (по умолчанию 300)
  *   announce        — писать в лог, что правило вставлено (по умолчанию false)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
@@ -62,6 +64,8 @@ interface Options {
   maxDocBlocks: number
   docWindow: number
   maxDocChars: number
+  docLlm: boolean
+  docLlmMax: number
   announce: boolean
   logFile?: string
 }
@@ -121,6 +125,8 @@ function readOptions(raw: unknown): Options {
     maxDocBlocks: Math.max(1, int(o.maxDocBlocks, 2)),
     docWindow: Math.max(0, int(o.docWindow, 1)),
     maxDocChars: Math.max(200, int(o.maxDocChars, 8000)),
+    docLlm: bool(o.docLlm, false),
+    docLlmMax: Math.max(10, int(o.docLlmMax, 300)),
     announce: bool(o.announce, false),
     logFile: typeof o.logFile === "string" && o.logFile.length > 0
       ? o.logFile
@@ -289,35 +295,12 @@ function clipBlock(text: string, limit: number): string {
 }
 
 /**
- * Ищет по телу абзацев, вес слова — редкость (IDF): «сервер» весит мало,
- * «сабагент» много. `minMatches` — сколько разных слов промпта должно совпасть.
- * Попадание расширяем на соседние абзацы (`window`), пересекающиеся окна склеиваем.
+ * Строит куски из попаданий: раздувает на `window` соседей, склеивает
+ * пересекающиеся окна, сортирует по позиции.
  */
-function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limit: number, window: number): DocPick[] {
-  const promptWords = stemWords(prompt)
-  if (promptWords.size === 0 || units.length === 0) return []
-  const df = new Map<string, number>()
-  for (const unit of units) {
-    for (const w of unit.words) df.set(w, (df.get(w) ?? 0) + 1)
-  }
-  const idf = (w: string) => Math.log(1 + units.length / (df.get(w) ?? 1))
-
-  const scored = units
-    .map((unit, index) => {
-      let matches = 0
-      let score = 0
-      for (const w of promptWords) {
-        if (!unit.words.has(w)) continue
-        matches += 1
-        score += idf(w)
-      }
-      return { index, matches, score }
-    })
-    .filter((x) => x.matches >= minMatches)
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-
+function picksFromHits(units: DocUnit[], hits: { index: number; score: number }[], limit: number, window: number): DocPick[] {
   const ranges: { lo: number; hi: number; best: number; score: number }[] = []
-  for (const hit of scored) {
+  for (const hit of hits) {
     if (ranges.length >= limit) break
     const lo = Math.max(0, hit.index - window)
     const hi = Math.min(units.length - 1, hit.index + window)
@@ -339,6 +322,74 @@ function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limi
     title: units[r.best].title,
     text: units.slice(r.lo, r.hi + 1).map((u) => u.text).join("\n\n"),
   }))
+}
+
+/**
+ * Ищет по телу абзацев, вес слова — редкость (IDF): «сервер» весит мало,
+ * «сабагент» много. `minMatches` — сколько разных слов промпта должно совпасть.
+ */
+function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limit: number, window: number): DocPick[] {
+  const promptWords = stemWords(prompt)
+  if (promptWords.size === 0 || units.length === 0) return []
+  const df = new Map<string, number>()
+  for (const unit of units) {
+    for (const w of unit.words) df.set(w, (df.get(w) ?? 0) + 1)
+  }
+  const idf = (w: string) => Math.log(1 + units.length / (df.get(w) ?? 1))
+
+  const hits = units
+    .map((unit, index) => {
+      let matches = 0
+      let score = 0
+      for (const w of promptWords) {
+        if (!unit.words.has(w)) continue
+        matches += 1
+        score += idf(w)
+      }
+      return { index, matches, score }
+    })
+    .filter((x) => x.matches >= minMatches)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+
+  return picksFromHits(units, hits, limit, window)
+}
+
+/**
+ * Семантический отбор: спрашиваем модель, какие абзацы подходят запросу.
+ * Нужен там, где словесный поиск промахнулся (синонимы, другой корень).
+ * Список кандидатов режем по `maxCandidates`, чтобы не раздувать запрос.
+ */
+async function llmSelect(
+  prompt: string,
+  units: DocUnit[],
+  generate: (text: string) => Promise<string>,
+  limit: number,
+  window: number,
+  maxCandidates: number,
+): Promise<DocPick[]> {
+  const preview = (unit: DocUnit) => unit.text.split("\n")[0].slice(0, 120)
+  let candidates = units.map((unit, index) => ({ unit, index }))
+  if (candidates.length > maxCandidates) {
+    const promptWords = new Set([...stemWords(prompt), ...words(prompt)])
+    const overlap = candidates.filter((c) => [...c.unit.words].some((w) => promptWords.has(w)))
+    const rest = candidates.filter((c) => !overlap.includes(c))
+    candidates = [...overlap, ...rest].slice(0, maxCandidates)
+  }
+  const listing = candidates.map((c, i) => `${i}: ${preview(c.unit)}`).join("\n")
+  const ask = [
+    "Ниже пронумерованные абзацы из файла-справочника и запрос пользователя.",
+    "Выбери номера абзацев, которые реально нужны для ответа на запрос.",
+    `Ответь только номерами через запятую (не больше ${limit}), или NONE.`,
+    "",
+    `Запрос: ${prompt}`,
+    "",
+    listing,
+  ].join("\n")
+  const answer = await generate(ask)
+  const indices = (answer.match(/\d+/g) ?? []).map(Number).filter((n) => n >= 0 && n < candidates.length)
+  if (indices.length === 0) return []
+  const hits = indices.slice(0, limit).map((n, order) => ({ index: candidates[n].index, score: 1 - order / 100 }))
+  return picksFromHits(units, hits, limit, window)
 }
 
 function renderRule(
@@ -405,11 +456,17 @@ export default Plugin.define({
       }
     }
 
+    /** Один вопрос модели внутри сессии: нужна для семантического добора по справочникам. */
+    const askModel = async (text: string, sessionID: string): Promise<string> => {
+      const answer = await ctx.session.generate({ sessionID, prompt: text })
+      return answer.text
+    }
+
     /**
      * Подбирает по промпту разделы из файлов-справочников. Возвращает готовые куски
      * для вставки в сообщение; один и тот же раздел в сессии не повторяем.
      */
-    const docsFor = (prompt: string, sessionID: string): string[] => {
+    const docsFor = async (prompt: string, sessionID: string): Promise<string[]> => {
       const seen = injectedDocs.get(sessionID) ?? new Set<string>()
       injectedDocs.set(sessionID, seen)
       const chunks: string[] = []
@@ -429,9 +486,18 @@ export default Plugin.define({
         const limit = spec.maxBlocks ?? options.maxDocBlocks
         const budget = spec.maxChars ?? options.maxDocChars
         const label = spec.title ?? spec.path
+        let picks = selectBlocks(prompt, cached.units, options.minDocScore, limit, options.docWindow)
+        if (picks.length === 0 && options.docLlm) {
+          try {
+            picks = await llmSelect(prompt, cached.units, (t) => askModel(t, sessionID), limit, options.docWindow, options.docLlmMax)
+            note(`doc llm: picked ${picks.length} (${path}) ${picks.map((p) => p.title).join(" | ")}`)
+          } catch (error) {
+            note(`doc llm failed ${path}: ${String(error)}`)
+          }
+        }
         let used = 0
         let added = 0
-        for (const block of selectBlocks(prompt, cached.units, options.minDocScore, limit, options.docWindow)) {
+        for (const block of picks) {
           const key = `${path}#${block.start}`
           if (seen.has(key) || used >= budget) continue
           const piece = clipBlock(block.text, budget - used)
@@ -460,7 +526,7 @@ export default Plugin.define({
 
         // справочники: релевантный раздел уезжает в контекст целиком; включается списком documents
         if (substantive && options.documents.length > 0) {
-          const chunks = docsFor(text, sessionID)
+          const chunks = await docsFor(text, sessionID)
           if (chunks.length > 0) {
             const labels = options.documents.map((d) => d.path).join(", ")
             event.prompt.text = `${text}\n\n<!-- skill-enforcer:doc-context -->\n[Выдержки из ${labels} — подставлены автоматически по смыслу запроса]\n\n${chunks.join("\n\n")}`
