@@ -35,6 +35,7 @@
 | `autoAttach` | `true` | Мастер-выключатель цепки; `false` — остаётся только правило |
 | `attachAlways` | `true` | Цеплять базовый набор общения (`alwaysSkills`) |
 | `attachPicked` | `true` | Цеплять добор по смыслу запроса |
+| `skillLlm` | `false` | Если словесный добор недобрал до `minSkills`, спросить модель по списку скиллов |
 | `alwaysSkills` | `["result-first","dialog-humanity","anti-ai-sludge"]` | База общения |
 | `maxAttach` | `6` | Потолок на всё, что цепляется к одному промпту; `0` — без потолка |
 | `padToMin` | `false` | Добивать добор до `minSkills` даже без совпадений |

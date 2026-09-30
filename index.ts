@@ -22,6 +22,7 @@ import { Plugin } from "@opencode/plugin"
  *   autoAttach      — мастер-выключатель автоприцепки (по умолчанию true)
  *   attachAlways    — цеплять базовый набор общения (по умолчанию true)
  *   attachPicked    — цеплять добор по смыслу запроса (по умолчанию true)
+ *   skillLlm        — если словесный добор недобрал до minSkills, спросить модель (по умолчанию false)
  *   padToMin        — добивать авто-подбор до minSkills даже без совпадений (по умолчанию false)
  *   defaultSkills   — список ID для добивки, когда padToMin включён
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
@@ -50,6 +51,8 @@ interface Options {
   attachAlways: boolean
   /** Цеплять добор по смыслу запроса. */
   attachPicked: boolean
+  /** Семантический добор скиллов через модель, когда словесный недобрал. */
+  skillLlm: boolean
   padToMin: boolean
   defaultSkills: string[]
   minPromptChars: number
@@ -114,6 +117,7 @@ function readOptions(raw: unknown): Options {
     autoAttach: bool(o.autoAttach, true),
     attachAlways: bool(o.attachAlways, true),
     attachPicked: bool(o.attachPicked, true),
+    skillLlm: bool(o.skillLlm, false),
     padToMin: bool(o.padToMin, false),
     defaultSkills: list(o.defaultSkills, []),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
@@ -173,6 +177,8 @@ function stemWords(text: string): Set<string> {
 
 interface SkillRef {
   id: string
+  /** Короткое описание — для семантического пика. */
+  description: string
   /** Слова из ID и из секции «Загружай, когда:» — вес 2. */
   trigger: Set<string>
   /** Остальное описание (кроме «Не грузи, когда:») — вес 1. */
@@ -187,6 +193,7 @@ function referenceOf(skill: { id: string; name?: string; description?: string })
   const bodyText = parts[0] ?? ""
   return {
     id: skill.id,
+    description,
     trigger: words(`${skill.id} ${skill.name ?? ""} ${triggerText}`),
     body: words(bodyText),
   }
@@ -419,6 +426,37 @@ async function llmSelect(
   return picksFromHits(units, hits, limit, window)
 }
 
+/**
+ * Семантический пик скиллов: когда словесный добор недобрал, спрашиваем модель по
+ * списку «id — описание». Возвращает ID из списка, максимум `need`.
+ */
+async function llmPickSkills(
+  prompt: string,
+  refs: SkillRef[],
+  generate: (text: string) => Promise<string>,
+  need: number,
+  log?: (message: string) => void,
+): Promise<string[]> {
+  if (refs.length === 0 || need <= 0) return []
+  const listing = refs.map((r) => `- ${r.id}: ${r.description.slice(0, 160)}`).join("\n")
+  const ask = [
+    "Ты подбираешь скиллы-инструкции под задачу пользователя.",
+    "Выбирай только те, что реально помогут ответить. Не выбирай скилл по названию инструмента.",
+    `Ответь не больше чем ${need} ID через запятую, ровно из списка ниже. Если подходящих нет — ответь NONE.`,
+    "",
+    `Запрос: ${prompt}`,
+    "",
+    "Скиллы:",
+    listing,
+  ].join("\n")
+  const answer = await generate(ask)
+  log?.(`skill llm raw: ${answer.replace(/\s+/g, " ").slice(0, 160)}`)
+  return refs
+    .map((r) => r.id)
+    .filter((id) => new RegExp(`(^|[^\\w-])${id}([^\\w-]|$)`).test(answer))
+    .slice(0, need)
+}
+
 function renderRule(
   min: number,
   max: number,
@@ -616,7 +654,7 @@ export default Plugin.define({
         }
 
         if (!options.autoAttach) return
-        if (!options.attachAlways && !options.attachPicked) return
+        if (!options.attachAlways && !options.attachPicked && !options.skillLlm) return
         if (!substantive) return
 
         const all = await skillsAtHand()
@@ -649,6 +687,24 @@ export default Plugin.define({
             if (contact.has(id) || attach.includes(id)) continue
             attach.push(id)
             taskAttached.push(id)
+          }
+        }
+
+        // гарантия: если рабочих скиллов меньше minSkills — спрашиваем модель и подкладываем
+        if (options.skillLlm && taskAttached.length < options.minSkills) {
+          try {
+            const need = options.minSkills - taskAttached.length
+            const candidates = all.filter((s) => !contact.has(s.id) && !attach.includes(s.id))
+            const picked = await llmPickSkills(text, candidates, (t) => askModel(t, sessionID), need, note)
+            for (const id of picked) {
+              if (atCap()) break
+              if (contact.has(id) || attach.includes(id)) continue
+              attach.push(id)
+              taskAttached.push(id)
+            }
+            note(`skill llm: picked ${picked.join(", ") || "—"} (session ${sessionID})`)
+          } catch (error) {
+            note(`skill llm failed: ${String(error)}`)
           }
         }
 
