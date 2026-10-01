@@ -22,7 +22,9 @@
     "typecheck": "tsc --noEmit",
     "probe": "bun run scripts/probe.ts",
     "probe:quality": "bun run scripts/probe.ts quality",
-    "probe:live": "bun run scripts/probe.ts live"
+    "probe:live": "bun run scripts/probe.ts live",
+    "probe:en": "bun run scripts/en-check.ts",
+    "probe:stem": "bun run scripts/stem-check.ts"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.18"

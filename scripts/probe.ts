@@ -226,7 +226,23 @@ function checkTokenizer() {
   ok("url вырезается", ![...stemWords("глянь https://x.dev/opencode")].includes("opencode"))
   ok("win-путь вырезается", ![...stemWords("глянь C:\\Users\\me\\opencode")].includes("opencode"))
   ok("слова промпта не теряются", stemWords("почини парсер конфига").has(stemWords("парсер").values().next().value!))
-  ok("латинские имена не режутся в уникальное", stemWords("telegram telethon api").size === 3, [...stemWords("telegram telethon api")].join(","))
+  // известная цена среза 4: telegram/telethon склеиваются в "tele".
+  // Ловим осознанно — если срез поменяют, тест это покажет.
+  {
+    const stems = [...stemWords("telegram telethon api")]
+    ok("telegram/telethon склеиваются — цена среза 4", stems.includes("tele"), stems.join(","))
+    ok("api (3 буквы латинские) не срезается", stems.includes("api"), stems.join(","))
+  }
+  // английские формы: без среза 4 не сходятся
+  {
+    const en = (a: string, b: string) => [...stemWords(a)][0] === [...stemWords(b)][0]
+    ok("en: test / tests", en("test", "tests"))
+    ok("en: parse / parsing", en("parse", "parsing"))
+    ok("en: cache / caching", en("cache", "caching"))
+    ok("en: index / indexing", en("index", "indexing"))
+    ok("ru: сабагент / сабагентов", en("сабагент", "сабагентов"))
+    ok("ru: ресурр / ресурса", en("ресурс", "ресурса"))
+  }
   ok("3-буквенные латинские целы", stemWords("почини mcp").has("mcp"))
   ok("стоп-слова выкинуты", !stemWords("скиллы и tools").has("скиллы"))
 }

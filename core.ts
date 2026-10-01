@@ -142,17 +142,38 @@ function withoutPaths(text: string): string {
 }
 
 /**
- * Значимые слова в нижнем регистре, с грубым стеммингом: у слов от 6 букв берём
- * первые 5. Русская морфология гуляет по падежам («ресёрча» / «ресёрч»),
- * без этого скилл про сабагентов не ловится на запрос «расскажи про сабагента».
- * Короткие латинские токены (mcp, api, ssh) пропускаем — это имена, не мусор.
+ * Порог среза зависит от языка текста. Русские формы длинные (6+ букв), срез
+ * до 5 работает: «сабагент»/«сабагентов» → «сабаг». Английские основы короткие
+ * (test, parse, cache) — до порога 6 не дотягивают, а срез 5 режет их не с той
+ * стороны: «test»/«tests» → «test»/«tests» и не сходится. Срез до 4 чинит
+ * английский полностью, русский при этом не ломается.
+ *
+ * Доля кириллицы считается один раз на весь текст, не на слово: у смешанного
+ * запроса («проверь код — check the code») порог берётся по большинству.
+ */
+const CUT_RU = 5
+const CUT_EN = 4
+const CYRILLIC_SHARE = 0.3
+
+function cyrillicShare(text: string): number {
+  const all = text.toLowerCase().split(/[^0-9a-zа-яё]+/).filter(Boolean)
+  if (all.length === 0) return 0
+  return all.filter((w) => /[а-яё]/.test(w)).length / all.length
+}
+
+/**
+ * Значимые слова в нижнем регистре, с грубым стеммингом по правилам языка.
+ * Без этого скилл про сабагентов не ловится на «расскажи про сабагента», а
+ * скилл про кэш — на «caching». Короткие латинские токены (mcp, api, ssh)
+ * пропускаем — это имена, не мусор.
  */
 export function stemWords(text: string): Set<string> {
+  const cut = cyrillicShare(text) > CYRILLIC_SHARE ? CUT_RU : CUT_EN
   const out = new Set<string>()
   for (const w of withoutPaths(text).toLowerCase().split(/[^0-9a-zа-яё]+/)) {
     const latinShort = /^[a-z0-9]{3}$/.test(w)
     if ((w.length < 4 && !latinShort) || STOP.has(w)) continue
-    out.add(w.length >= 6 ? w.slice(0, 5) : w)
+    out.add(w.length >= cut + 1 ? w.slice(0, cut) : w)
   }
   return out
 }
