@@ -24,6 +24,7 @@ import {
   TAG,
 } from "./core.ts"
 import { embedPick } from "./core-embed.ts"
+import { cloudPick } from "./core-embed-cloud.ts"
 import { referenceOf } from "./core.ts"
 
 /**
@@ -239,28 +240,33 @@ export default Plugin.define({
           // На 44 размеченных промптах гибрид дал 21 чистый ответ против 19
           // у одной лексики и recall 77% против 62%; эмбеддинг как основной
           // ранкер дал 6 чистых — мусор. Поэтому он именно запасной путь.
-          if (options.embed && matched.length === 0) {
+          // Облачный вариант меряем отдельно и он на скиллах не выигрывает,
+          // но оставлен флагом как управляемый выход из лексики.
+          const embedLabel = options.embedCloud ? "embed cloud" : "embed"
+          if (matched.length === 0 && (options.embed || options.embedCloud)) {
             try {
-              const byMeaning = await embedPick(
-                text,
-                all.map((s) => ({ id: s.id, text: s.description })),
-                options.maxSkills,
-              )
+              const items = all.map((s) => ({ id: s.id, text: s.description }))
+              const byMeaning = options.embedCloud
+                ? await cloudPick(text, items, options.maxSkills, {
+                    model: options.embedCloudModel,
+                    ns: "skills",
+                  })
+                : await embedPick(text, items, options.maxSkills)
               if (byMeaning) {
                 const fresh = byMeaning.filter(
                   (id) => available.has(id) && !skillInContext(id) && !attach.includes(id),
                 )
-                note(`embed: ${fresh.join(", ") || "—"} ${byMeaning.length - fresh.length} отброшено`)
+                note(`${embedLabel}: ${fresh.join(", ") || "—"} ${byMeaning.length - fresh.length} отброшено`)
                 for (const id of fresh) {
                   if (atCap()) break
                   attach.push(id)
                   taskAttached.push(id)
                 }
               } else {
-                note("embed: недоступен, остаёмся на лексике")
+                note(`${embedLabel}: недоступен, остаёмся на лексике`)
               }
             } catch (error) {
-              note(`embed failed: ${String(error).slice(0, 120)}`)
+              note(`${embedLabel} failed: ${String(error).slice(0, 120)}`)
             }
           }
           for (const id of matched) {
@@ -338,6 +344,38 @@ export default Plugin.define({
         // 10–20 секунд. Кандидаты оставляем только те, где есть хотя бы одно
         // совпадение; если таких нет — не зовём модель вовсе.
         const docWithHits = docCandidates.filter((c) => docHitCount.get(`${c.doc}.${c.unit}`) ?? 0 > 0)
+        // Облачный слой для блоков: срабатывает там же, где лексика молчит, и не
+        // зависит от docLlm — его задача не в брокере, а в заполнении дыры без
+        // вызова LLM. Платим сетью и текстом наружу, поэтому по умолчанию off.
+        if (options.embedCloud) {
+          const empty = plans
+            .map((plan, di) => ({ plan, di }))
+            .filter(({ plan }) => plan.picks.length === 0)
+          const blocks = empty.flatMap(({ plan, di }) =>
+            plan.units.map((u, ui) => ({ id: `${di}.${ui}`, text: u.text })),
+          )
+          if (blocks.length > 0) {
+            try {
+              const byMeaning = await cloudPick(text, blocks, options.maxDocBlocks, {
+                model: options.embedCloudModel,
+                ns: "docs",
+              })
+              if (byMeaning && byMeaning.length > 0) {
+                for (const id of byMeaning) {
+                  const [di, ui] = id.split(".").map(Number)
+                  const plan = plans[di]
+                  if (!plan || Number.isNaN(ui)) continue
+                  plan.picks.push(...picksFromHits(plan.units, [{ index: ui, score: 1 }], plan.limit, options.docWindow))
+                }
+                note(`doc embed cloud: ${byMeaning.length} блок(ов) — ${byMeaning.join(", ")}`)
+              } else {
+                note("doc embed cloud: пусто или недоступно")
+              }
+            } catch (error) {
+              note(`doc embed cloud failed: ${String(error).slice(0, 120)}`)
+            }
+          }
+        }
         if (needDocs > 0 && docCandidates.length > 0 && docWithHits.length === 0) {
           needDocs = 0
           note(`doc no overlap: в файле нет ни одного слова из запроса, брокер пропущен`)

@@ -28,6 +28,19 @@ export interface Options {
    * Тянет модель 130 МБ в ~/.cache/skill-enforcer — выключается флагом.
    */
   embed: boolean
+  /**
+   * Эмбеддинги через OpenRouter вместо локальной модели. Выключен по
+   * умолчанию: платим сетью (~1.1 с на запрос) и отправляем текст наружу.
+   * Ключ берётся из OPENROUTER_API_KEY или ~/.config/skill-enforcer/openrouter.key.
+   *
+   * Замер на 34 реальных промптах: для скиллов чуть хуже одной лексики
+   * (recall 76% против 78%, лишних 23 против 19), для блоков справочника
+   * порога не существует — мусор набирает 0.636, лучший настоящий промпт 0.614.
+   * Оставлено как управляемый выход на случай, когда лексика молчит целиком.
+   */
+  embedCloud: boolean
+  /** Модель облачного эмбеддинга. */
+  embedCloudModel: string
   skillLlm: boolean
   minPromptChars: number
   /** Абсолютный пол счёта: ниже — не берём вообще. */
@@ -89,6 +102,10 @@ export function readOptions(raw: unknown): Options {
     attachAlways: bool(o.attachAlways, true),
     attachPicked: bool(o.attachPicked, true),
     embed: bool(o.embed, true),
+    embedCloud: bool(o.embedCloud, false),
+    embedCloudModel: typeof o.embedCloudModel === "string" && o.embedCloudModel.length > 0
+      ? o.embedCloudModel
+      : "baai/bge-m3",
     skillLlm: bool(o.skillLlm, false),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
     // Счёт с IDF, поэтому абсолютные числа зависят от размера каталога: работает
