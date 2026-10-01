@@ -23,6 +23,11 @@ export interface Options {
   autoAttach: boolean
   attachAlways: boolean
   attachPicked: boolean
+  /**
+   * Второй слой отбора по смыслу, когда лексика не нашла ничего.
+   * Тянет модель 130 МБ в ~/.cache/skill-enforcer — выключается флагом.
+   */
+  embed: boolean
   skillLlm: boolean
   minPromptChars: number
   /** Абсолютный пол счёта: ниже — не берём вообще. */
@@ -83,6 +88,7 @@ export function readOptions(raw: unknown): Options {
     autoAttach: bool(o.autoAttach, true),
     attachAlways: bool(o.attachAlways, true),
     attachPicked: bool(o.attachPicked, true),
+    embed: bool(o.embed, true),
     skillLlm: bool(o.skillLlm, false),
     minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
     // Счёт с IDF, поэтому абсолютные числа зависят от размера каталога: работает

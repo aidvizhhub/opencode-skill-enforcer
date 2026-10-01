@@ -23,6 +23,7 @@ import {
   picksFromHits,
   TAG,
 } from "./core.ts"
+import { embedPick } from "./core-embed.ts"
 import { referenceOf } from "./core.ts"
 
 /**
@@ -234,6 +235,34 @@ export default Plugin.define({
             options.minRatio,
             options.minWords,
           )
+          // Эмбеддинг включается только там, где лексика не нашла ничего.
+          // На 44 размеченных промптах гибрид дал 21 чистый ответ против 19
+          // у одной лексики и recall 77% против 62%; эмбеддинг как основной
+          // ранкер дал 6 чистых — мусор. Поэтому он именно запасной путь.
+          if (options.embed && matched.length === 0) {
+            try {
+              const byMeaning = await embedPick(
+                text,
+                all.map((s) => ({ id: s.id, text: s.description })),
+                options.maxSkills,
+              )
+              if (byMeaning) {
+                const fresh = byMeaning.filter(
+                  (id) => available.has(id) && !skillInContext(id) && !attach.includes(id),
+                )
+                note(`embed: ${fresh.join(", ") || "—"} ${byMeaning.length - fresh.length} отброшено`)
+                for (const id of fresh) {
+                  if (atCap()) break
+                  attach.push(id)
+                  taskAttached.push(id)
+                }
+              } else {
+                note("embed: недоступен, остаёмся на лексике")
+              }
+            } catch (error) {
+              note(`embed failed: ${String(error).slice(0, 120)}`)
+            }
+          }
           for (const id of matched) {
             if (atCap()) break
             if (skillInContext(id) || attach.includes(id)) continue

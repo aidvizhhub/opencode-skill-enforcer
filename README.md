@@ -35,6 +35,24 @@ git clone https://github.com/aidvizhhub/opencode-skill-enforcer
 cd opencode-skill-enforcer && npm install
 ```
 
+### Эмбеддинги и `postinstall`
+
+Слой отбора по смыслу работает на `onnxruntime-node`, а у него есть
+`postinstall`. `npm install` его выполнит, а вот `bun install` — заблокирует, и
+модуль молча вернёт `null`, то есть плагин останется на лексике. При установке
+через bun:
+
+```bash
+bun install && bun pm trust onnxruntime-node
+```
+
+Модель `multilingual-e5-small` (130 МБ) скачивается сама при первом запросе и
+лежит в `~/.cache/skill-enforcer/`. Сеть нужна только для этого. Если её нет,
+плагин работает на лексике — об этом пишет строка `embed: недоступен` в логе.
+
+Отключается флагом `"embed": false`, тогда возвращается поведение без
+зависимости вообще.
+
 Дальше — в `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc

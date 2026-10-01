@@ -29,6 +29,7 @@
     "probe:triggers2": "bun run scripts/add-triggers.ts"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.0",
     "@opencode/plugin": "2.0.18"
   },
   "devDependencies": {
