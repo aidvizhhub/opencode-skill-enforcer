@@ -25,7 +25,8 @@
     "probe:live": "bun run scripts/probe.ts live",
     "probe:en": "bun run scripts/en-check.ts",
     "probe:stem": "bun run scripts/stem-check.ts",
-    "probe:triggers": "bun run scripts/backfill-triggers.ts"
+    "probe:triggers": "bun run scripts/backfill-triggers.ts",
+    "probe:triggers2": "bun run scripts/add-triggers.ts"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.18"

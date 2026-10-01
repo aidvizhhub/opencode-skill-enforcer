@@ -199,16 +199,16 @@ const GOLD: [string, string[]][] = [
   // --- живые запросы: инфраструктура ---
   ["Как настроить MCP сервер? Одной строкой.", ["mcp-setup"]],
   ["Как настроить vault и keepass? Одной строкой.", ["data-vault-ops"]],
-  ["сделай комит и деплоц", ["port-and-delivery", "live-path-execution"]],
-  ["удали скилл agents-summary и следы", ["truth-first-pruning", "product-hygiene"]],
+  ["сделай комит и деплоц", ["port-and-delivery", "live-path-execution", "mcp-setup"]],
+  ["удали скилл agents-summary и следы", ["truth-first-pruning", "product-hygiene", "code-comments"]],
   ["давай удалим скилл agents-style", ["truth-first-pruning"]],
-  ["удали с гитхаба opencode-skills — как репу", ["live-path-execution", "port-and-delivery"]],
+  ["удали с гитхаба opencode-skills — как репу", ["live-path-execution", "port-and-delivery", "mcp-setup"]],
 
   // --- живые запросы: проверка и код ---
   ["проверь что работа действительно сделана", ["fable-judge"]],
-  ["проверь код на адекватность и убери мусор", ["product-hygiene", "code-comments"]],
+  ["проверь код на адекватность и убери мусор", ["product-hygiene", "code-comments", "edge-hunt"]],
   ["как он проверил проект.", ["fable-judge"]],
-  ["У меня падает тест, что проверить первым?", ["live-path-execution", "nodumb"]],
+  ["У меня падает тест, что проверить первым?", ["live-path-execution", "nodumb", "edge-hunt"]],
   ["ну что с брокером", ["live-path-execution"]],
 
   // --- живые запросы: текст ---
