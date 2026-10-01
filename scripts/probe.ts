@@ -181,7 +181,8 @@ const GOLD_NEGATIVE: string[] = [
   "проверь ~/Projects/opencode-skill-enforcer",
   "глянь https://github.com/aidvizhhub/opencode-skill-enforcer",
   "ok",
-  "а если по-другому?",
+  // «а если по-другому» убран из негатива: goal-driven-exploration прямо
+  // объявляет эту фразу триггером, ловить её — правильное поведение.
 ]
 
 // ---------------------------------------------------------------- checks
@@ -528,6 +529,8 @@ const mode = process.argv[2] ?? "all"
 
 if (mode === "quality") {
   checkQuality()
+  console.log(`\n${failures === 0 ? "все проверки прошли" : `ПРОВАЛЕНО ${failures} из ${checks}`}`)
+  if (failures > 0) process.exit(1)
 } else if (mode === "live") {
   await checkLive()
 } else {

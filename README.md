@@ -86,6 +86,7 @@ bun run probe:quality     # замеры отбора на твоём катал
 bun run probe:live        # один настоящий opencode run
 bun run probe:stem        # стеммер: русский и английский отдельно
 bun run probe:en          # отбор на английском каталоге (создай свой или передай путь)
+bun run probe:triggers    # проставить «Загружай, когда» скиллам без них (--write чтобы применить)
 bun run scripts/diag.ts ~/.config/opencode/plugin.log   # разбор живого лога
 ```
 
