@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["index.ts"]
+  "include": ["index.ts", "core.ts", "scripts/**/*.ts"]
 }

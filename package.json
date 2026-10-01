@@ -8,12 +8,21 @@
     "type": "git",
     "url": "git+https://github.com/aidvizhhub/opencode-skill-enforcer.git"
   },
-  "keywords": ["opencode", "opencode-plugin", "skills", "context", "llm"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "skills",
+    "context",
+    "llm"
+  ],
   "exports": {
     ".": "./index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "probe": "bun run scripts/probe.ts",
+    "probe:quality": "bun run scripts/probe.ts quality",
+    "probe:live": "bun run scripts/probe.ts live"
   },
   "dependencies": {
     "@opencode/plugin": "2.0.18"

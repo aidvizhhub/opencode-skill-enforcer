@@ -1,10 +1,33 @@
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
-import { homedir, tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { appendFileSync, readFileSync, statSync } from "node:fs"
 import { Plugin } from "@opencode/plugin"
+import {
+  expandHome,
+  llmBroker,
+  makeCache,
+  pickSkills,
+  readOptions,
+  renderRule,
+  selectBlocks,
+  splitDoc,
+  stemWords,
+  unitPreview,
+  type BrokerDocCandidate,
+  type DocPick,
+  type DocUnit,
+  type Options,
+  type SkillRef,
+  clipBlock,
+  contentHash,
+  hasOverlap,
+  numMatches,
+  picksFromHits,
+  TAG,
+} from "./core.ts"
+import { referenceOf } from "./core.ts"
 
 /**
- * skill-enforcer — заставляет агента реально работать со скиллами.
+ * Обвязка плагина: хуки, состояние сессии, файлы-справочники. Вся проверяемая
+ * логика — в `core.ts`, её дёргает `scripts/probe.ts`.
  *
  * Три рычага:
  *  1. session.hook("context") — на каждом шаге модели (включая продолжения после
@@ -24,7 +47,9 @@ import { Plugin } from "@opencode/plugin"
  *   attachPicked    — цеплять добор по смыслу запроса (по умолчанию true)
  *   skillLlm        — если словесный добор недобрал до minSkills, спросить модель (по умолчанию false)
  *   minPromptChars  — не трогать короткие реплики короче этого (по умолчанию 12)
- *   minScore        — порог совпадения для авто-подбора; триггер весит 2, описание 1 (по умолчанию 3)
+ *   minScore        — абсолютный пол счёта для авто-подбора (по умолчанию 4)
+ *   minRatio        — доля от лучшего счёта в ходе; ниже — не берём (по умолчанию 0.6)
+ *   minWords        — сколько разных слов промпта должно совпасть с описанием (по умолчанию 2)
  *   documents       — файлы-справочники: по промпту находим релевантный кусок текста
  *                     (по абзацам, не по заголовкам) и подкладываем его в контекст.
  *                     Пусто — выключено.
@@ -39,598 +64,14 @@ import { Plugin } from "@opencode/plugin"
  *   brokerHints     — указания брокеру под свой набор скиллов (по умолчанию пусто)
  *   cacheFile       — файл кэша выбора брокера; по умолчанию в системной папке /tmp
  *                     (пустая строка — кэш выключен)
- *   cacheHours      — сколько дней запись в кэше живёт (по умолчанию 3)
+ *   cacheHours      — сколько часов запись в кэше живёт (по умолчанию 72, то есть трое суток)
  *   logFile         — путь к файлу-маркеру; если задан, туда пишутся все события
  */
-
-const TAG = "[skill-enforcer]"
-
-interface Options {
-  minSkills: number
-  maxSkills: number
-  /** Мастер-выключатель всей автоприцепки. false — остаётся только правило-напоминание. */
-  autoAttach: boolean
-  /** Цеплять базовый набор общения (alwaysSkills). */
-  attachAlways: boolean
-  /** Цеплять добор по смыслу запроса. */
-  attachPicked: boolean
-  /** Семантический добор скиллов через модель, когда словесный недобрал. */
-  skillLlm: boolean
-  minPromptChars: number
-  minScore: number
-  /** Скиллы «человеческого общения», которые держим в контакте всегда (цепляем один раз за сессию). */
-  alwaysSkills: string[]
-  /** Потолок на всё, что плагин цепляет к одному промпту (база + добор). */
-  maxAttach: number
-  /** Файлы-справочники: релевантный раздел уезжает в контекст целиком. */
-  documents: DocSpec[]
-  minDocScore: number
-  maxDocBlocks: number
-  docWindow: number
-  maxDocChars: number
-  docLlm: boolean
-  docLlmMax: number
-  /** Сколько скиллов-кандидатов показывать модели (только с лексическим совпадением). */
-  skillLlmMax: number
-  /** Указания брокеру под свой набор скиллов: «правка кода — вот этот скилл». */
-  brokerHints: string
-  /** Файл кэша выбора брокера; пусто — кэш выключен. */
-  cacheFile: string
-  /** Сколько дней запись в кэше живёт. */
-  cacheHours: number
-  logFile?: string
-}
-
-/** Описание файла-справочника: путь и персональные лимиты. */
-interface DocSpec {
-  path: string
-  title?: string
-  maxBlocks?: number
-  maxChars?: number
-}
-
-/** База общения под конкретного человека: имена скиллов у каждого свои. */
-const DEFAULT_ALWAYS: string[] = []
-
-function readOptions(raw: unknown): Options {
-  const o = (raw ?? {}) as Record<string, unknown>
-  const int = (v: unknown, fallback: number) =>
-    typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : fallback
-  const bool = (v: unknown, fallback: boolean) => (typeof v === "boolean" ? v : fallback)
-  const list = (v: unknown, fallback: string[]) =>
-    Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : fallback
-  const docs = (v: unknown): DocSpec[] => {
-    if (!Array.isArray(v)) return []
-    const out: DocSpec[] = []
-    for (const item of v) {
-      if (typeof item === "string" && item.length > 0) {
-        out.push({ path: item })
-        continue
-      }
-      if (!item || typeof item !== "object") continue
-      const d = item as Record<string, unknown>
-      if (typeof d.path !== "string" || d.path.length === 0) continue
-      out.push({
-        path: d.path,
-        title: typeof d.title === "string" ? d.title : undefined,
-        maxBlocks: typeof d.maxBlocks === "number" ? Math.max(1, Math.trunc(d.maxBlocks)) : undefined,
-        maxChars: typeof d.maxChars === "number" ? Math.max(200, Math.trunc(d.maxChars)) : undefined,
-      })
-    }
-    return out
-  }
-  return {
-    minSkills: Math.max(0, int(o.minSkills, 3)),
-    maxSkills: Math.max(1, int(o.maxSkills, 5)),
-    autoAttach: bool(o.autoAttach, true),
-    attachAlways: bool(o.attachAlways, true),
-    attachPicked: bool(o.attachPicked, true),
-    skillLlm: bool(o.skillLlm, false),
-    minPromptChars: Math.max(0, int(o.minPromptChars, 12)),
-    minScore: Math.max(1, int(o.minScore, 3)),
-    alwaysSkills: list(o.alwaysSkills, DEFAULT_ALWAYS),
-    maxAttach: Math.max(0, int(o.maxAttach, 6)),
-    documents: docs(o.documents),
-    minDocScore: Math.max(1, int(o.minDocScore, 2)),
-    maxDocBlocks: Math.max(1, int(o.maxDocBlocks, 2)),
-    docWindow: Math.max(0, int(o.docWindow, 1)),
-    maxDocChars: Math.max(200, int(o.maxDocChars, 8000)),
-    docLlm: bool(o.docLlm, false),
-    docLlmMax: Math.max(10, int(o.docLlmMax, 300)),
-    skillLlmMax: Math.max(3, int(o.skillLlmMax, 12)),
-    brokerHints: typeof o.brokerHints === "string" ? o.brokerHints : "",
-    cacheFile:
-      typeof o.cacheFile === "string" && o.cacheFile.length > 0
-        ? o.cacheFile
-        : join(tmpdir(), "opencode-skill-enforcer", "broker-cache.json"),
-    cacheHours: Math.max(1, int(o.cacheHours, 72)),
-    logFile: typeof o.logFile === "string" && o.logFile.length > 0
-      ? o.logFile
-      : process.env.SKILL_ENFORCER_DEBUG || undefined,
-  }
-}
-
-/** Слова, которые не считаем за совпадение — они есть почти в любом скилле. */
-const STOP = new Set([
-  "что", "чтобы", "чтоб", "как", "когда", "зачем", "почему", "если", "или", "для",
-  "тебя", "меня", "него", "нее", "них", "нам", "вам", "это", "этот", "эта", "эти",
-  "все", "всё", "дает", "дать", "будет", "было", "есть", "надо", "нужно", "можно",
-  "ещё", "еще", "уже", "даже", "тоже", "также", "просто", "только", "очень", "самый",
-  "такой", "такая", "такое", "такие", "делать", "сделать", "делай", "хочешь", "хочет",
-  "скилл", "скиллы", "скиллов", "скиллам", "skills", "skill", "workflow", "tool", "tools",
-  "which", "what", "when", "where", "with", "from", "this", "that", "these", "those",
-  "your", "yours", "have", "make", "want", "need", "just", "like", "does", "doing",
-  "the", "and", "for", "not", "are", "was", "were", "will", "would", "should",
-])
-
-/** Значимые слова (от 4 букв, без стоп-слов) в нижнем регистре. */
-function words(text: string): Set<string> {
-  const out = new Set<string>()
-  for (const w of text.toLowerCase().split(/[^0-9a-zа-яё]+/)) {
-    if (w.length >= 4 && !STOP.has(w)) out.add(w)
-  }
-  return out
-}
-
-/**
- * То же, но с грубым стеммингом: у слов от 6 букв берём первые 5. Русская
- * морфология гуляет по падежам («ресёрча» / «ресёрч»), без этого не сходится.
- * Короткие латинские токены (mcp, api, ssh) пропускаем — это имена, не мусор.
- */
-function stemWords(text: string): Set<string> {
-  const out = new Set<string>()
-  for (const w of text.toLowerCase().split(/[^0-9a-zа-яё]+/)) {
-    const latinShort = /^[a-z0-9]{3}$/.test(w)
-    if ((w.length < 4 && !latinShort) || STOP.has(w)) continue
-    out.add(w.length >= 6 ? w.slice(0, 5) : w)
-  }
-  return out
-}
-
-interface SkillRef {
-  id: string
-  /** Короткое описание — для семантического пика. */
-  description: string
-  /** Слова из ID и из секции «Загружай, когда:» — вес 2. */
-  trigger: Set<string>
-  /** Остальное описание (кроме «Не грузи, когда:») — вес 1. */
-  body: Set<string>
-}
-
-function referenceOf(skill: { id: string; name?: string; description?: string }): SkillRef {
-  const description = skill.description ?? ""
-  const [beforeNegative] = description.split(/Не грузи/i)
-  const parts = beforeNegative.split(/Загружай,?\s*когда:?/i)
-  const triggerText = parts.length > 1 ? parts.slice(1).join(" ") : ""
-  const bodyText = parts[0] ?? ""
-  return {
-    id: skill.id,
-    description,
-    trigger: words(`${skill.id} ${skill.name ?? ""} ${triggerText}`),
-    body: words(bodyText),
-  }
-}
-
-/** Сколько весит совпадение слов запроса со скиллом: триггер 2, описание 1. */
-function overlap(prompt: string, skill: SkillRef): number {
-  const promptWords = words(prompt)
-  let score = 0
-  for (const w of skill.trigger) if (promptWords.has(w)) score += 2
-  for (const w of skill.body) if (promptWords.has(w)) score += 1
-  return score
-}
-
-function pickSkills(prompt: string, skills: SkillRef[], limit: number, minScore: number): string[] {
-  const promptWords = words(prompt)
-  if (promptWords.size === 0) return []
-  const scored: { id: string; score: number }[] = []
-  for (const skill of skills) {
-    let score = 0
-    for (const w of skill.trigger) if (promptWords.has(w)) score += 2
-    for (const w of skill.body) if (promptWords.has(w)) score += 1
-    if (score >= minScore) scored.push({ id: skill.id, score })
-  }
-  scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
-  return scored.slice(0, limit).map((s) => s.id)
-}
-
-/** `~` и `~/x` — в домашний каталог. */
-function expandHome(path: string): string {
-  if (path === "~") return homedir()
-  if (path.startsWith("~/")) return join(homedir(), path.slice(2))
-  return path
-}
-
-interface DocUnit {
-  start: number
-  end: number
-  title: string
-  text: string
-  words: Set<string>
-}
-
-interface DocPick {
-  start: number
-  title: string
-  text: string
-}
-
-const HEADING = /^(#{1,6})\s+(.+)$/
-
-/** Абзацы файла: единица кончается на пустой строке, код и списки не рвём. */
-function atomsOf(text: string): DocUnit[] {
-  const lines = text.split(/\r?\n/)
-  const units: DocUnit[] = []
-  let start = -1
-  let buf: string[] = []
-  let fence = false
-  let heading: string | undefined
-
-  const flush = (end: number) => {
-    if (start < 0) return
-    const chunk = buf.join("\n").trim()
-    const from = start
-    start = -1
-    buf = []
-    if (!chunk) return
-    const title = labelOf(chunk) ?? heading ?? chunk.split("\n")[0].trim().slice(0, 80)
-    units.push({ start: from, end, title, text: chunk, words: stemWords(chunk) })
-  }
-
-  const nextMeaningful = (i: number): string | undefined => {
-    for (let j = i + 1; j < lines.length; j++) if (lines[j].trim() !== "") return lines[j]
-    return undefined
-  }
-  const lastBuffered = (): string => {
-    for (let j = buf.length - 1; j >= 0; j--) if (buf[j].trim() !== "") return buf[j]
-    return ""
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    if (/^\s*(```|~~~)/.test(line)) fence = !fence
-    if (line.trim() === "" && !fence) {
-      // список из пунктов, разделённых пустой строкой, — один кусок, не рвём
-      const next = nextMeaningful(i)
-      if (LIST_ITEM.test(lastBuffered()) && next !== undefined && LIST_ITEM.test(next)) continue
-      flush(i)
-      continue
-    }
-    const m = !fence ? line.trim().match(HEADING) : null
-    if (m) heading = m[2].trim()
-    if (start < 0) start = i
-    buf.push(line)
-  }
-  flush(lines.length)
-
-  const merged: DocUnit[] = []
-  for (let i = 0; i < units.length; i++) {
-    const unit = units[i]
-    const next = units[i + 1]
-    if (next && isHeadingOnly(unit.text)) {
-      next.start = unit.start
-      next.text = `${unit.text}\n${next.text}`
-      next.words = stemWords(next.text)
-      next.title = labelOf(next.text) ?? next.title
-      continue
-    }
-    merged.push(unit)
-  }
-  return merged
-}
-
-/** Целевой размер блока: меньше — огрызок, больше — лишний вес. */
-const DOC_BLOCK_MIN = 600
-const DOC_BLOCK_MAX = 1200
-
-/**
- * Режет файл на блоки по размеру: копим абзацы, пока блок не станет весомым.
- * Новый блок начинаем у заголовка (если минимум уже набран) или по достижении
- * максимума. Так вместо сотни огрызков выходят нормальные куски текста.
- */
-function splitDoc(text: string): DocUnit[] {
-  const atoms = atomsOf(text)
-  const blocks: DocUnit[] = []
-  let parts: string[] = []
-  let start = -1
-  let end = -1
-  let title = ""
-  const size = () => parts.reduce((n, p) => n + p.length + 2, 0)
-  const flush = () => {
-    if (!parts.length) return
-    const chunk = parts.join("\n\n")
-    blocks.push({
-      start,
-      end,
-      title: title || chunk.split("\n")[0].trim().slice(0, 80),
-      text: chunk,
-      words: stemWords(chunk),
-    })
-    parts = []
-  }
-  for (const atom of atoms) {
-    const sectionStart = HEADING.test(atom.text.split("\n")[0].trim())
-    if (parts.length > 0 && ((sectionStart && size() >= DOC_BLOCK_MIN) || size() >= DOC_BLOCK_MAX)) flush()
-    if (parts.length === 0) {
-      start = atom.start
-      title = atom.title
-    }
-    parts.push(atom.text)
-    end = atom.end
-  }
-  flush()
-  return blocks
-}
-
-function isHeadingOnly(text: string): boolean {
-  return text.split("\n").every((line) => HEADING.test(line.trim()))
-}
-
-/** Подпись куска: заголовок внутри, иначе последний виденный заголовок, иначе первая строка. */
-function labelOf(text: string): string | undefined {
-  let heading: string | undefined
-  for (const line of text.split("\n")) {
-    const m = line.trim().match(HEADING)
-    if (m) heading = m[2].trim()
-  }
-  return heading
-}
-
-/** Короткий хэш текста: меняется — значит кусок в контексте устарел. */
-function contentHash(text: string): string {
-  let h = 5381
-  for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0
-  return h.toString(36)
-}
-
-interface CacheEntry {
-  skills: string[]
-  /** куски справочников по хэшу текста, а не по номеру: при правке файла номер сдвинется, хэш — нет. */
-  docs: string[]
-  at: number
-}
-
-/** Ключ — от текста запроса без регистра, пунктуации и хвоста: «объясни API» и «Объясни API!!» — одно и то же. */
-function cacheKey(prompt: string): string {
-  const norm = prompt
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-  return contentHash(norm.slice(0, 400))
-}
-
-/** Кэш выбора брокера. Файл читается один раз за сессию плагина, запись переписывает его целиком. */
-function makeCache(file: string, ttlHours: number, note: (m: string) => void) {
-  let entries: Map<string, CacheEntry> | null = null
-
-  const load = () => {
-    if (entries) return entries
-    entries = new Map()
-    try {
-      const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, CacheEntry>
-      for (const [key, value] of Object.entries(raw)) {
-        if (Array.isArray(value?.skills) && typeof value.at === "number") {
-          entries.set(key, { skills: value.skills, docs: Array.isArray(value.docs) ? value.docs : [], at: value.at })
-        }
-      }
-    } catch {
-      // файла нет или он битый — просто начинаем с пустого кэша
-    }
-    return entries
-  }
-
-  const ttl = ttlHours * 3600_000
-
-  return {
-    get(prompt: string): CacheEntry | null {
-      const entry = load().get(cacheKey(prompt))
-      if (!entry) return null
-      if (Date.now() - entry.at > ttl) {
-        load().delete(cacheKey(prompt))
-        return null
-      }
-      return entry
-    },
-    set(prompt: string, skills: string[], docs: string[]) {
-      const map = load()
-      const key = cacheKey(prompt)
-      map.set(key, { skills, docs, at: Date.now() })
-      const fresh: Record<string, CacheEntry> = {}
-      for (const [k, v] of map) if (Date.now() - v.at <= ttl) fresh[k] = v
-      try {
-        mkdirSync(dirname(file), { recursive: true })
-        writeFileSync(file, JSON.stringify(fresh))
-      } catch (error) {
-        note(`cache write failed: ${String(error)}`)
-      }
-    },
-    size: () => load().size,
-  }
-}
-
-const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s/
-
-/** Обрезка по границе абзаца возле предела, чтобы не рвать фразу на полуслове. */
-function clipBlock(text: string, limit: number): string {
-  if (text.length <= limit) return text
-  const cut = text.slice(0, limit)
-  const lastParagraph = cut.lastIndexOf("\n\n")
-  return (lastParagraph > limit * 0.5 ? cut.slice(0, lastParagraph) : cut).trimEnd()
-}
-
-/**
- * Строит куски из попаданий: раздувает на `window` соседей, склеивает
- * пересекающиеся окна, сортирует по позиции.
- */
-function picksFromHits(units: DocUnit[], hits: { index: number; score: number }[], limit: number, window: number): DocPick[] {
-  const ranges: { lo: number; hi: number; best: number; score: number }[] = []
-  for (const hit of hits) {
-    if (ranges.length >= limit) break
-    const lo = Math.max(0, hit.index - window)
-    const hi = Math.min(units.length - 1, hit.index + window)
-    const touching = ranges.find((r) => lo <= r.hi + 1 && r.lo <= hi + 1)
-    if (touching) {
-      touching.lo = Math.min(touching.lo, lo)
-      touching.hi = Math.max(touching.hi, hi)
-      if (hit.score > touching.score) {
-        touching.score = hit.score
-        touching.best = hit.index
-      }
-      continue
-    }
-    ranges.push({ lo, hi, best: hit.index, score: hit.score })
-  }
-  ranges.sort((a, b) => a.lo - b.lo)
-  return ranges.map((r) => ({
-    start: units[r.lo].start,
-    title: units[r.best].title,
-    text: units.slice(r.lo, r.hi + 1).map((u) => u.text).join("\n\n"),
-  }))
-}
-
-/**
- * Ищет по телу абзацев, вес слова — редкость (IDF): «сервер» весит мало,
- * «сабагент» много. `minMatches` — сколько разных слов промпта должно совпасть.
- */
-function selectBlocks(prompt: string, units: DocUnit[], minMatches: number, limit: number, window: number): DocPick[] {
-  const promptWords = stemWords(prompt)
-  if (promptWords.size === 0 || units.length === 0) return []
-  const df = new Map<string, number>()
-  for (const unit of units) {
-    for (const w of unit.words) df.set(w, (df.get(w) ?? 0) + 1)
-  }
-  const idf = (w: string) => Math.log(1 + units.length / (df.get(w) ?? 1))
-
-  const hits = units
-    .map((unit, index) => {
-      let matches = 0
-      let score = 0
-      for (const w of promptWords) {
-        if (!unit.words.has(w)) continue
-        matches += 1
-        score += idf(w)
-      }
-      return { index, matches, score }
-    })
-    .filter((x) => x.matches >= minMatches)
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-
-  return picksFromHits(units, hits, limit, window)
-}
-
-/**
- * Семантический отбор: спрашиваем модель, какие абзацы подходят запросу.
- * Нужен там, где словесный поиск промахнулся (синонимы, другой корень).
- * Список кандидатов режем по `maxCandidates`, чтобы не раздувать запрос.
- */
-/** Короткое превью абзаца для показа модели. */
-function unitPreview(unit: DocUnit): string {
-  return unit.text.split("\n").slice(0, 3).join(" ").slice(0, 200)
-}
-
-interface BrokerDocCandidate {
-  doc: number
-  unit: number
-  preview: string
-}
-
-interface BrokerResult {
-  skills: string[]
-  docs: { doc: number; unit: number }[]
-}
-
-/**
- * Один вызов модели на оба источника: выбирает и скиллы, и абзацы справочников.
- * Ответ ждём двумя строками: `SKILLS: ...` и `DOCS: D<док>.<абзац>, ...`.
- */
-async function llmBroker(input: {
-  prompt: string
-  skills: SkillRef[]
-  needSkills: number
-  docs: BrokerDocCandidate[]
-  needDocs: number
-  hints?: string
-  generate: (text: string) => Promise<string>
-  log?: (message: string) => void
-}): Promise<BrokerResult> {
-  const lines = [
-    "Ты подбираешь материалы под задачу. Выбирай только то, что реально поможет ответить.",
-    "Не выбирай по названию инструмента: скилл про сам инструмент нужен, только когда",
-    "задача прямо про этот инструмент. Если подходящего нет — пиши NONE.",
-  ]
-  // Указания под свой набор скиллов — из конфига, а не в коде плагина.
-  if (input.hints) lines.push(input.hints)
-  lines.push("", `Запрос: ${input.prompt}`, "")
-  if (input.needSkills > 0 && input.skills.length > 0) {
-    lines.push(`СКИЛЛЫ (выбери до ${input.needSkills}, или NONE):`)
-    for (const s of input.skills) lines.push(`- ${s.id}: ${s.description.slice(0, 160)}`)
-    lines.push("")
-  }
-  if (input.needDocs > 0 && input.docs.length > 0) {
-    lines.push(`АБЗАЦЫ (выбери до ${input.needDocs}, формат D<документ>.<абзац>, или NONE):`)
-    for (const c of input.docs) lines.push(`[D${c.doc}.${c.unit}] ${c.preview}`)
-    lines.push("")
-  }
-  lines.push("Ответ строго двумя строками, без пояснений:")
-  lines.push("SKILLS: <id, id | NONE>")
-  lines.push("DOCS: <D0.3, D1.7 | NONE>")
-
-  const answer = await input.generate(lines.join("\n"))
-  input.log?.(`broker raw: ${answer.replace(/\s+/g, " ").slice(0, 200)}`)
-
-  const skillsLine = answer.match(/SKILLS:\s*([^\n]*)/i)?.[1] ?? ""
-  const docsLine = answer.match(/DOCS:\s*([^\n]*)/i)?.[1] ?? ""
-
-  const skills = input.skills
-    .map((s) => s.id)
-    .filter((id) => new RegExp(`(^|[^\\w-])${id}([^\\w-]|$)`).test(skillsLine))
-    .slice(0, Math.max(0, input.needSkills))
-
-  const docs: { doc: number; unit: number }[] = []
-  if (input.needDocs > 0) {
-    for (const m of docsLine.matchAll(/D(\d+)\.(\d+)/gi)) {
-      const doc = Number(m[1])
-      const unit = Number(m[2])
-      if (docs.some((d) => d.doc === doc && d.unit === unit)) continue
-      docs.push({ doc, unit })
-      if (docs.length >= input.needDocs) break
-    }
-  }
-  return { skills, docs }
-}
-
-function renderRule(
-  min: number,
-  max: number,
-  taskLoaded: number,
-  taskInContact: string[],
-  baseInContact: string[],
-  configuredBase: string[],
-): string {
-  let baseLine: string
-  if (baseInContact.length > 0) {
-    baseLine = `Базовые скиллы общения держим в контакте всегда: ${baseInContact.join(", ")}. Не отвечай вопреки им.`
-  } else if (configuredBase.length > 0) {
-    baseLine = `Базовый набор общения (${configuredBase.join(", ")}) ещё не в контакте — загрузи его через skill, если отвечаешь живым текстом.`
-  } else {
-    baseLine = "Базовых скиллов общения не задано."
-  }
-  const contactLine = taskInContact.length === 0
-    ? "Рабочих скиллов в контакте пока нет — загрузи первым делом, прежде чем отвечать по существу."
-    : `Уже в контакте по задаче: ${taskInContact.join(", ")}. Следуй им и не перезагружай без нужды; сменилась задача — добери по теме.`
-  return [
-    "ПРАВИЛО СКИЛЛОВ (проверка на каждом шаге):",
-    `1. ${baseLine}`,
-    `2. Перед содержательным ответом сверься со списком скиллов и загрузи через инструмент skill минимум ${min} подходящих по задаче (цель ${min}–${max}). Сейчас по задаче в контакте: ${taskLoaded}/${min}.`,
-    `3. ${contactLine}`,
-  ].join("\n")
-}
 
 export default Plugin.define({
   id: "skill-enforcer",
   setup(ctx) {
-    const options = readOptions(ctx.options)
+    const options: Options = readOptions(ctx.options)
     /** sessionID -> всё, что уже в контексте (база + рабочие, прицепленные или загруженные инструментом). */
     const inContact = new Map<string, Set<string>>()
     /** sessionID -> рабочие скиллы, попавшие в контекст в текущем ходе (для счётчика «минимум N»). */
@@ -639,6 +80,26 @@ export default Plugin.define({
     const docCache = new Map<string, { mtimeMs: number; units: DocUnit[] }>()
     /** sessionID -> какие куски справочников уже подставлены (фолбэк, когда история недоступна). */
     const injectedDocs = new Map<string, Set<string>>()
+    /** sessionID -> когда последний раз видели сессию; по этому подрезаем карты. */
+    const seenAt = new Map<string, number>()
+
+    /**
+     * Сессии в картах живут до перезапуска сервиса, а сервис не перезапускают
+     * неделями. Срезаем всё, к чему не возвращались дольше суток.
+     */
+    const SESSION_TTL = 24 * 3600_000
+    const touch = (sessionID: string) => {
+      seenAt.set(sessionID, Date.now())
+      if (seenAt.size <= 64) return
+      const cutoff = Date.now() - SESSION_TTL
+      for (const [id, at] of seenAt) {
+        if (at > cutoff) continue
+        seenAt.delete(id)
+        inContact.delete(id)
+        turnTask.delete(id)
+        injectedDocs.delete(id)
+      }
+    }
 
     const note = (message: string) => {
       const line = `${new Date().toISOString()} ${TAG} ${message}\n`
@@ -653,12 +114,17 @@ export default Plugin.define({
 
     const cache = makeCache(options.cacheFile, options.cacheHours, note)
 
+    /** id всех известных скиллов: tool-hook не должен верить модели на слово. */
+    let knownSkills = new Set<string>()
+
     const skillsAtHand = async (): Promise<SkillRef[]> => {
       try {
         const all = (await ctx.skill.list()).data
-        return all
-          .filter((s) => s.autoinvoke !== false && typeof s.description === "string" && s.description.length > 0)
-          .map(referenceOf)
+        const usable = all.filter(
+          (s) => s.autoinvoke !== false && typeof s.description === "string" && s.description.length > 0,
+        )
+        knownSkills = new Set(all.map((s) => s.id))
+        return usable.map(referenceOf)
       } catch (error) {
         note(`skill.list failed: ${String(error)}`)
         return []
@@ -671,10 +137,6 @@ export default Plugin.define({
       return answer.text
     }
 
-    /**
-     * Подбирает по промпту разделы из файлов-справочников. Возвращает готовые куски
-     * для вставки в сообщение; один и тот же раздел в сессии не повторяем.
-     */
     /**
      * Текст последних сообщений сессии — по нему видно, лежит ли кусок в контексте
      * прямо сейчас (после сжатия истории он может выпасть, тогда подставим снова).
@@ -690,7 +152,7 @@ export default Plugin.define({
     }
 
     /** Читает файл-справочник (кэш по mtime) и режет на блоки. */
-    const docUnitsFor = (spec: DocSpec): { path: string; label: string; units: DocUnit[] } | null => {
+    const docUnitsFor = (spec: { path: string; title?: string }): { path: string; label: string; units: DocUnit[] } | null => {
       const path = expandHome(spec.path)
       let cached = docCache.get(path)
       try {
@@ -718,6 +180,7 @@ export default Plugin.define({
     ctx.session.hook("prompt", async (event) => {
       try {
         const sessionID = event.sessionID
+        touch(sessionID)
         const current = event.prompt.skills ?? []
         const contact = inContact.get(sessionID) ?? new Set<string>()
         for (const s of current) contact.add(String(s.id))
@@ -763,7 +226,14 @@ export default Plugin.define({
           }
         }
         if (options.attachPicked) {
-          const matched = pickSkills(text, all, options.maxSkills, options.minScore)
+          const matched = pickSkills(
+            text,
+            all,
+            options.maxSkills,
+            options.minScore,
+            options.minRatio,
+            options.minWords,
+          )
           for (const id of matched) {
             if (atCap()) break
             if (skillInContext(id) || attach.includes(id)) continue
@@ -777,16 +247,42 @@ export default Plugin.define({
           options.skillLlm && taskAttached.length < options.minSkills
             ? options.minSkills - taskAttached.length
             : 0
+        // кандидаты брокеру — те, у кого хоть слово совпало (порог 1), плюс ещё
+        // не в контакте: из полного каталога модель выбирает заметно хуже
+        // Кандидаты для модели — те, кто ещё не в контакте и хоть как-то
+        // пересекается со словами запроса. Порог цепки (minWords) тут не
+        // применяем: на «объясни простыми словами» лексика берёт explain-simply,
+        // а смотреть модели есть на шесть скиллов, иначе выбор сводится к нулю.
         const skillCandidates = options.skillLlm
           ? all
-              .filter((s) => !skillInContext(s.id) && !attach.includes(s.id))
-              .filter((s) => overlap(text, s) > 0)
+              .filter((s) => !skillInContext(s.id) && !attach.includes(s.id) && hasOverlap(text, s))
+              .sort((a, b) => numMatches(text, b) - numMatches(text, a))
               .slice(0, options.skillLlmMax)
           : []
+        // Модель нужна только там, где дешёвая эвристика не дала ответа.
+        // Кандидатов нужно взять, пока они идут вровень по числу совпадений:
+        // при needSkills=2 и трёх одинаково подходящих скиллах выбор между
+        // ними ничего не решает, а вызов стоит 10–20 секунд.
+        if (needSkills > 0 && skillCandidates.length > 0) {
+          const scores = skillCandidates.map((s) => numMatches(text, s))
+          const good = scores.filter((n) => n >= Math.max(...scores)).length
+          if (good <= needSkills) {
+            for (const s of skillCandidates) {
+              if (atCap()) break
+              attach.push(s.id)
+              taskAttached.push(s.id)
+            }
+            needSkills = 0
+            note(`lexical enough: ${skillCandidates.map((s) => s.id).join(", ")}`)
+          }
+        }
         const docNeeding = options.docLlm ? plans.filter((p) => p.picks.length === 0) : []
         const docCandidates: BrokerDocCandidate[] = []
+        /** "док.блок" → сколько слов запроса попало. По этому режем заведомый мусор. */
+        const docHitCount = new Map<string, number>()
         if (docNeeding.length > 0) {
-          const promptWords = new Set([...stemWords(text), ...words(text)])
+          // слова блоков тоже stemWords — сравнивать надо в одном пространстве
+          const promptWords = stemWords(text)
           const rank = (unit: DocUnit) => {
             let n = 0
             for (const w of unit.words) if (promptWords.has(w)) n++
@@ -799,12 +295,34 @@ export default Plugin.define({
             const order = plan.units.map((u, i) => ({ u, i })).sort((a, b) => rank(b.u) - rank(a.u))
             for (const { u, i } of order) {
               if (free <= 0) break
+              const n = rank(u)
+              docHitCount.set(`${di}.${i}`, n)
               docCandidates.push({ doc: di, unit: i, preview: unitPreview(u) })
               free--
             }
           }
         }
-        const needDocs = docNeeding.reduce((n, p) => n + p.limit, 0)
+        // needDocs — только по документам, где словесный поиск не нашёл ничего.
+        let needDocs = docNeeding.reduce((n, p) => n + p.limit, 0)
+        // Показывать модели 33 блока, ни один из которых не пересекается со
+        // словами запроса, бессмысленно: она отвечает NONE, а вызов стоит
+        // 10–20 секунд. Кандидаты оставляем только те, где есть хотя бы одно
+        // совпадение; если таких нет — не зовём модель вовсе.
+        const docWithHits = docCandidates.filter((c) => docHitCount.get(`${c.doc}.${c.unit}`) ?? 0 > 0)
+        if (needDocs > 0 && docCandidates.length > 0 && docWithHits.length === 0) {
+          needDocs = 0
+          note(`doc no overlap: в файле нет ни одного слова из запроса, брокер пропущен`)
+        }
+        // Если блоков мало — выбирать не из чего, берём первые по частотности.
+        if (needDocs > 0 && docWithHits.length > 0 && docWithHits.length <= needDocs) {
+          for (const c of docWithHits) {
+            const plan = plans[c.doc]
+            if (!plan) continue
+            plan.picks.push(...picksFromHits(plan.units, [{ index: c.unit, score: 1 }], plan.limit, options.docWindow))
+          }
+          note(`doc lexical enough: ${docWithHits.length} блок(ов) из ${docWithHits.map((c) => `D${c.doc}.${c.unit}`).join(", ")}`)
+          needDocs = 0
+        }
         // 1) кэш: повторяющийся запрос закрываем без вызова модели. Кусок справочника
         // узнаём по хэшу текста — после правки файла он переехал, но хэш тот же.
         let needModel = needDocs > 0 && docCandidates.length > 0
@@ -931,6 +449,7 @@ export default Plugin.define({
 
     ctx.session.hook("context", (event) => {
       try {
+        touch(event.sessionID)
         const contact = inContact.get(event.sessionID) ?? new Set<string>()
         const base = options.alwaysSkills.filter((id) => contact.has(id))
         const task = [...contact].filter((id) => !base.includes(id))
@@ -951,6 +470,12 @@ export default Plugin.define({
         const input = event.input as { id?: unknown } | undefined
         const id = typeof input?.id === "string" ? input.id : undefined
         if (!id) return
+        // каталог ещё не сходили (правый ход без prompt-hook) — тогда не фильтруем
+        if (knownSkills.size > 0 && !knownSkills.has(id)) {
+          note(`skipped unknown skill: ${id} (session ${event.sessionID})`)
+          return
+        }
+        touch(event.sessionID)
         const turnSet = turnTask.get(event.sessionID) ?? new Set<string>()
         turnSet.add(id)
         turnTask.set(event.sessionID, turnSet)
