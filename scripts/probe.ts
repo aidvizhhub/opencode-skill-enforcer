@@ -244,6 +244,24 @@ function checkTokenizer() {
     ok("ru: сабагент / сабагентов", en("сабагент", "сабагентов"))
     ok("ru: ресурр / ресурса", en("ресурс", "ресурса"))
   }
+  // Смешанный текст: срез выбирается по алфавиту слова, а не по доле
+  // кириллицы во всём описании. Раньше английская база плюс русские
+  // триггеры уводили порог в срез 4, и русские слова переставали сходиться
+  // с русским промптом при полном совпадении.
+  {
+    const en = "after any agent or model claims work is complete, judge this work"
+    const ru = "проверь что работа сделана, верифицируй"
+    const mixed = new Set(stemWords(`${en}; ${ru}`))
+    const ruOnly = new Set(stemWords(ru))
+    ok(
+      "ru-слова в смешанном тексте не срезаются как английские",
+      [...ruOnly].every((w) => mixed.has(w)),
+      [...ruOnly].filter((w) => !mixed.has(w)).join(","),
+    )
+    const prompt = new Set(stemWords("проверь что работа сделана"))
+    const hit = [...prompt].filter((w) => mixed.has(w))
+    ok("ru-промпт сходится со смешанным описанием", hit.length >= 3, `совпало ${hit.length}`)
+  }
   ok("3-буквенные латинские целы", stemWords("почини mcp").has("mcp"))
   ok("стоп-слова выкинуты", !stemWords("скиллы и tools").has("скиллы"))
 }

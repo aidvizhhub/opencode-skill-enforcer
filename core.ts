@@ -148,18 +148,15 @@ function withoutPaths(text: string): string {
  * стороны: «test»/«tests» → «test»/«tests» и не сходится. Срез до 4 чинит
  * английский полностью, русский при этом не ломается.
  *
- * Доля кириллицы считается один раз на весь текст, не на слово: у смешанного
- * запроса («проверь код — check the code») порог берётся по большинству.
+ * Срез выбирается по алфавиту самого слова, а не по доле кириллицы во всём
+ * тексте. Раньше порог брался один на текст, и смешанное описание (английская
+ * база плюс русские триггеры, как у fable-*) уходило в срез 4: «проверь» →
+ * «пров» при промптовом «прове». Пересечение пустело, скилл ловил ноль при
+ * полном совпадении слов. У настоящего fable-judge доля кириллицы в
+ * триггерах — 6%.
  */
 const CUT_RU = 5
 const CUT_EN = 4
-const CYRILLIC_SHARE = 0.3
-
-function cyrillicShare(text: string): number {
-  const all = text.toLowerCase().split(/[^0-9a-zа-яё]+/).filter(Boolean)
-  if (all.length === 0) return 0
-  return all.filter((w) => /[а-яё]/.test(w)).length / all.length
-}
 
 /**
  * Значимые слова в нижнем регистре, с грубым стеммингом по правилам языка.
@@ -168,11 +165,11 @@ function cyrillicShare(text: string): number {
  * пропускаем — это имена, не мусор.
  */
 export function stemWords(text: string): Set<string> {
-  const cut = cyrillicShare(text) > CYRILLIC_SHARE ? CUT_RU : CUT_EN
   const out = new Set<string>()
   for (const w of withoutPaths(text).toLowerCase().split(/[^0-9a-zа-яё]+/)) {
     const latinShort = /^[a-z0-9]{3}$/.test(w)
     if ((w.length < 4 && !latinShort) || STOP.has(w)) continue
+    const cut = /[а-яё]/.test(w) ? CUT_RU : CUT_EN
     out.add(w.length >= cut + 1 ? w.slice(0, cut) : w)
   }
   return out
