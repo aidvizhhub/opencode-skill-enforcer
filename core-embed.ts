@@ -75,14 +75,16 @@ async function getEncoder(): Promise<Encoder | null> {
       const model = await lib.AutoModel.from_pretrained(MODEL_ID, { dtype: "q8" })
       encoder = {
         encode: async (texts) => {
-          const enc = await tok(texts)
+          // Обрезка обязательна: у e5 512 позиций, а блок справочника на 1400
+          // символов даёт до 957 токенов. Без обрезки onnxruntime падает на
+          // broadcast (512 by 957) и весь отбор молча уходит в null.
+          const enc = await tok(texts, { truncation: true, max_length: 512, padding: true })
           const out = await model({
             input_ids: enc.input_ids,
             attention_mask: enc.attention_mask,
           })
           const hidden = out.last_hidden_state ?? Object.values(out)[0]
-          const count = texts.length
-          return pool(hidden, enc.attention_mask.data, count)
+          return pool(hidden, enc.attention_mask.data, texts.length)
         },
       }
       return encoder
@@ -95,9 +97,17 @@ async function getEncoder(): Promise<Encoder | null> {
   return loading
 }
 
-/** Отпечаток каталога: меняется, когда изменилось любое описание. */
+/**
+ * Отпечаток каталога: меняется, когда изменилось описание либо правило
+ * кодирования. Версия входит в хэш, иначе смена префикса или обрезки молча
+ * оставила бы в кэше вектора, посчитанные по старым правилам.
+ */
+const ENCODE_VERSION = "passage1-trunc512"
+
 function fingerprint(skills: { id: string; text: string }[]): string {
   return createHash("sha256")
+    .update(ENCODE_VERSION)
+    .update("\n")
     .update(skills.map((s) => `${s.id}:${s.text}`).join("\n"))
     .digest("hex")
     .slice(0, 16)
@@ -140,10 +150,14 @@ async function catalogVectors(
   const enc = await getEncoder()
   if (!enc) return null
   try {
-    // по одному: батчи требуют аккуратной сборки масок, а каталог считается один раз
+    // по одному: батчи требуют аккуратной сборки масок, а набор считается один раз
     const vectors: Float32Array[] = []
     for (const s of skills) {
-      const [v] = await enc.encode([`${s.id}. ${s.text}`])
+      // Префикс passage: обязателен и несимметричен — e5 обучен на паре
+      // «query: …» против «passage: …». Без него вектор каталога и вектор
+      // запроса лежат в разных пространствах, косинус держится около 0.8
+      // для любого текста, включая мусор, и порог теряет смысл.
+      const [v] = await enc.encode([`passage: ${s.id}. ${s.text}`])
       vectors.push(v)
     }
     writeIndex({ hash, ids: skills.map((s) => s.id), vectors: vectors.map((v) => Array.from(v)) })
