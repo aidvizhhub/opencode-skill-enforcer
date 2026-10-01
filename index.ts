@@ -323,6 +323,20 @@ export default Plugin.define({
           note(`doc lexical enough: ${docWithHits.length} блок(ов) из ${docWithHits.map((c) => `D${c.doc}.${c.unit}`).join(", ")}`)
           needDocs = 0
         }
+        // Скиллы лексика уже закрыла, а блоков документа больше, чем нужно.
+        // Раньше в этом случае модель звали ради выбора между блоками: на живых
+        // прогонах это стоило 15.9 секунды на два вызова, оба вернули пусто по
+        // скиллам. Если нужные скиллы уже есть, платить за выбор блока нечем —
+        // брокер больше не за что звать.
+        if (needDocs > 0 && needSkills === 0 && docWithHits.length > needDocs) {
+          for (const c of docWithHits) {
+            const plan = plans[c.doc]
+            if (!plan) continue
+            plan.picks.push(...picksFromHits(plan.units, [{ index: c.unit, score: 1 }], plan.limit, options.docWindow))
+          }
+          note(`doc lexical enough (скиллы уже есть): ${docWithHits.length} блок(ов) из ${docWithHits.map((c) => `D${c.doc}.${c.unit}`).join(", ")}`)
+          needDocs = 0
+        }
         // 1) кэш: повторяющийся запрос закрываем без вызова модели. Кусок справочника
         // узнаём по хэшу текста — после правки файла он переехал, но хэш тот же.
         let needModel = needDocs > 0 && docCandidates.length > 0
